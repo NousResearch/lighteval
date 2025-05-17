@@ -94,11 +94,14 @@ class GenerationParameters(BaseModel, extra="forbid"):
         """Selects relevant generation and sampling parameters for litellm models.
         Doc: https://docs.litellm.ai/docs/completion/input#input-params-1
 
+        Note: max_new_tokens is mapped to max_completion_tokens here, but will be
+        converted to max_tokens in the LiteLLMClient for non-o-series models.
+
         Returns:
             dict: The parameters to create a litellm.SamplingParams in the model config.
         """
         args = {
-            "max_completion_tokens": self.max_new_tokens,
+            "max_completion_tokens": self.max_new_tokens,  # Will be transformed to max_tokens for non-o-series models
             "stop": self.stop_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,

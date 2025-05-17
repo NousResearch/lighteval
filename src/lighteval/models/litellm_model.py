@@ -22,10 +22,15 @@
 
 import logging
 import time
+import json
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from tqdm import tqdm
+from rich import print as rprint
+from rich.pretty import pprint
+from rich.panel import Panel
+from rich.console import Console
 
 from lighteval.data import GenerativeTaskDataset
 from lighteval.models.abstract_model import LightevalModel
@@ -46,6 +51,7 @@ from lighteval.utils.imports import is_litellm_available
 
 
 logger = logging.getLogger(__name__)
+console = Console()
 
 if is_litellm_available():
     import litellm
@@ -89,7 +95,7 @@ class LiteLLMClient(LightevalModel):
         self.API_MAX_RETRY = 5
         self.API_RETRY_SLEEP = 3
         self.API_RETRY_MULTIPLIER = 2
-        self.CONCURENT_CALLS = 20  # 100 leads to hitting Anthropic rate limits
+        self.CONCURENT_CALLS = 100  # 100 leads to hitting Anthropic rate limits
 
         self._tokenizer = encode
         self.pairwise_tokenization = False
@@ -109,17 +115,18 @@ class LiteLLMClient(LightevalModel):
         if not max_new_tokens or max_new_tokens <= 0:
             return None
 
-        if "o1" in self.model:
+        if any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]):
             # We need to allow more tokens to include reasoning tokens
             max_new_tokens = min(max_new_tokens * 10, 32000)
         return max_new_tokens
 
-    def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence):
+    def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata=None):
         """Make API call with retries."""
         response = ModelResponse()
         for attempt in range(self.API_MAX_RETRY):
             try:
                 stop_sequence = self._prepare_stop_sequence(stop_sequence)
+                original_max_new_tokens = max_new_tokens
                 max_new_tokens = self._prepare_max_new_tokens(max_new_tokens)
 
                 if return_logits and not self.provider == "openai":
@@ -135,14 +142,79 @@ class LiteLLMClient(LightevalModel):
                     "caching": True,
                     "api_key": self.api_key,
                 }
-                if "o1" in self.model:
-                    logger.warning("O1 models do not support temperature, top_p, stop sequence. Disabling.")
+                if any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]):
+                    logger.warning("OpenAI o-series models do not support temperature, top_p, stop sequence. Disabling.")
                 else:
-                    kwargs.update(self.generation_parameters.to_litellm_dict())
+                    # Update with generation parameters
+                    litellm_params = self.generation_parameters.to_litellm_dict()
+                    
+                    # If max_new_tokens is specified in generation parameters, handle it differently
+                    # Rename max_new_tokens to max_tokens for non-o-series models
+                    if "max_completion_tokens" in litellm_params and not any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]):
+                        litellm_params["max_tokens"] = litellm_params.pop("max_completion_tokens")
+                    
+                    kwargs.update(litellm_params)
 
-                if kwargs.get("max_completion_tokens", None) is None:
-                    kwargs["max_completion_tokens"] = max_new_tokens
-
+                # Use max_tokens instead of max_completion_tokens for all models except those starting with "o1", "o3", or "o4"
+                # Only set these if they aren't already set from generation_parameters
+                if not kwargs.get("max_completion_tokens") and not kwargs.get("max_tokens"):
+                    if any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]):
+                        kwargs["max_completion_tokens"] = max_new_tokens
+                    else:
+                        kwargs["max_tokens"] = max_new_tokens
+                
+                # Rich logging of the request details
+                request_info = {
+                    "model": self.model,
+                    "provider": self.provider,
+                    "original_max_new_tokens": original_max_new_tokens,
+                    "adjusted_max_new_tokens": max_new_tokens,
+                    "max_completion_tokens": kwargs.get("max_completion_tokens"),
+                    "max_tokens": kwargs.get("max_tokens"),
+                    "is_o_series_model": any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]),
+                    "token_param_used": "max_completion_tokens" if any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]) else "max_tokens",
+                    "num_samples": num_samples,
+                    "message_count": len(prompt) if isinstance(prompt, list) else 0,
+                    "generation_parameters": {k: v for k, v in kwargs.items() 
+                                            if k not in ["model", "messages", "api_key", "base_url", "n", "caching"]}
+                }
+                
+                # Prepare a base meta string for titles if metadata provided
+                if metadata:
+                    try:
+                        idx = int(metadata.get("index", 1))
+                        total = int(metadata.get("total", 0))
+                    except Exception:
+                        idx = metadata.get("index", 1)
+                        total = metadata.get("total", 0)
+                    base_meta = f"{metadata.get('benchmark', '')} {idx}/{total}"
+                else:
+                    base_meta = None
+                # Print the request in a panel with rich formatting
+                if base_meta:
+                    request_title = f"LiteLLM API Request — {base_meta} — attempt {attempt+1}/{self.API_MAX_RETRY}"
+                else:
+                    request_title = "LiteLLM API Request"
+                console.print(Panel.fit(
+                    "\n".join([
+                        "[bold cyan]LiteLLM Request Details:[/bold cyan]",
+                        f"[green]Model:[/green] {request_info['model']}",
+                        f"[green]Provider:[/green] {request_info['provider']}",
+                        f"[green]O-series Model:[/green] {request_info['is_o_series_model']}",
+                        f"[green]Token Parameter Used:[/green] {request_info['token_param_used']}",
+                        f"[green]Original max_new_tokens:[/green] {request_info['original_max_new_tokens']}",
+                        f"[green]Adjusted max_new_tokens:[/green] {request_info['adjusted_max_new_tokens']}",
+                        f"[green]max_completion_tokens:[/green] {request_info['max_completion_tokens']}",
+                        f"[green]max_tokens:[/green] {request_info['max_tokens']}",
+                        f"[green]num_samples:[/green] {request_info['num_samples']}",
+                        f"[green]message_count:[/green] {request_info['message_count']}",
+                        "[green]Generation Parameters:[/green]"
+                    ]),
+                    title=request_title,
+                    border_style="blue"
+                ))
+                pprint(request_info["generation_parameters"])
+                
                 response = litellm.completion(**kwargs)
 
                 # If response is empty, retry without caching (maybe the error is recoverable and solved with a retry)
@@ -150,6 +222,32 @@ class LiteLLMClient(LightevalModel):
                     kwargs["caching"] = False
                     logger.info("Response is empty, retrying without caching")
                     response = litellm.completion(**kwargs)
+                
+                # Log response details
+                try:
+                    # Use base_meta to build response title
+                    if base_meta:
+                        response_title = f"LiteLLM API Response — {base_meta} — attempt {attempt+1}/{self.API_MAX_RETRY}"
+                    else:
+                        response_title = "LiteLLM API Response"
+                    console.print(Panel.fit(
+                        "\n".join([
+                            "[bold cyan]LiteLLM Response Summary:[/bold cyan]",
+                            f"[green]Completion ID:[/green] {response.id}",
+                            f"[green]Model:[/green] {response.model}",
+                            f"[green]Created at:[/green] {response.created}",
+                            f"[green]Number of choices:[/green] {len(response.choices)}",
+                            f"[green]Content length:[/green] {len(response.choices[0].message.content or '') if response.choices else 0} chars",
+                            f"[green]Usage - Prompt tokens:[/green] {response.usage.prompt_tokens if response.usage else 'N/A'}",
+                            f"[green]Usage - Completion tokens:[/green] {response.usage.completion_tokens if response.usage else 'N/A'}",
+                            f"[green]Usage - Total tokens:[/green] {response.usage.total_tokens if response.usage else 'N/A'}"
+                        ]),
+                        title=response_title,
+                        border_style="green"
+                    ))
+                except Exception as e:
+                    console.print(f"[yellow]Warning: Could not print full response details: {e}[/yellow]")
+                    
                 return response
             except litellm.BadRequestError as e:
                 if "message" in e.__dict__:
@@ -159,14 +257,48 @@ class LiteLLMClient(LightevalModel):
                     if error_string in e.__dict__["message"]:
                         logger.warning(f"{error_string}. Returning empty response.")
                         return ModelResponse()
+                
+                # Use the same base_meta to build error title
+                if base_meta:
+                    error_title = f"LiteLLM API Error — {base_meta} — attempt {attempt+1}/{self.API_MAX_RETRY}"
+                else:
+                    error_title = "LiteLLM API Error"
+                console.print(Panel.fit(
+                    f"[bold red]Error in API Call (attempt {attempt + 1}/{self.API_MAX_RETRY}):[/bold red]\n{str(e)}",
+                    title=error_title,
+                    border_style="red"
+                ))
             except Exception as e:
                 wait_time = min(64, self.API_RETRY_SLEEP * (2**attempt))  # Exponential backoff with max 64s
+                
+                # Use the same base_meta to build error title for retry
+                if base_meta:
+                    error_title = f"LiteLLM API Error — {base_meta} — attempt {attempt+1}/{self.API_MAX_RETRY}"
+                else:
+                    error_title = "LiteLLM API Error"
+                console.print(Panel.fit(
+                    f"[bold red]Error in API Call (attempt {attempt + 1}/{self.API_MAX_RETRY}):[/bold red]\n{str(e)}\n\n" +
+                    f"[yellow]Waiting {wait_time} seconds before retry...[/yellow]",
+                    title=error_title,
+                    border_style="red"
+                ))
+                
                 logger.warning(
                     f"Error in API call: {e}, waiting {wait_time} seconds before retry {attempt + 1}/{self.API_MAX_RETRY}"
                 )
                 time.sleep(wait_time)
 
         logger.error(f"API call failed after {self.API_MAX_RETRY} attempts, returning empty response.")
+        # Use base_meta to build final failure title
+        if base_meta:
+            failure_title = f"LiteLLM API Failure — {base_meta} — attempts {self.API_MAX_RETRY}"
+        else:
+            failure_title = "LiteLLM API Failure"
+        console.print(Panel.fit(
+            f"[bold red]API call failed after {self.API_MAX_RETRY} attempts[/bold red]\nReturning empty response.",
+            title=failure_title,
+            border_style="red"
+        ))
         return ModelResponse()
 
     def __call_api_parallel(
@@ -176,6 +308,7 @@ class LiteLLMClient(LightevalModel):
         max_new_tokens: int | list[int],
         num_samples: int | list[int],
         stop_sequence: list[str] | None = None,
+        metadata: list[dict] | None = None,
     ):
         results = []
 
@@ -187,6 +320,10 @@ class LiteLLMClient(LightevalModel):
             len(prompts) == len(return_logitss) == len(max_new_tokenss) == len(num_sampless) == len(stop_sequencess)
         ), f"Length of prompts, return_logitss, max_new_tokenss, num_sampless, stop_sequences, system_prompts should be the same but are {len(prompts)}, {len(return_logitss)}, {len(max_new_tokenss)}, {len(num_sampless)}, {len(stop_sequencess)}"
 
+        # Align metadata list with prompts
+        metadata_list = metadata if metadata is not None else [None] * len(prompts)
+        assert len(prompts) == len(metadata_list), f"Length of prompts ({len(prompts)}) and metadata ({len(metadata_list)}) must be the same"
+
         with ThreadPoolExecutor(self.CONCURENT_CALLS) as executor:
             for entry in tqdm(
                 executor.map(
@@ -196,6 +333,7 @@ class LiteLLMClient(LightevalModel):
                     max_new_tokenss,
                     num_sampless,
                     stop_sequencess,
+                    metadata_list,
                 ),
                 total=len(prompts),
             ):
@@ -225,6 +363,7 @@ class LiteLLMClient(LightevalModel):
             request.tokenized_context = self.tok_encode(request.context)
 
         dataset = GenerativeTaskDataset(requests=requests, num_dataset_splits=self.DATASET_SPLITS)
+        total_requests = dataset.total_size
         results = []
 
         for split in tqdm(
@@ -232,7 +371,7 @@ class LiteLLMClient(LightevalModel):
             total=dataset.num_dataset_splits,
             desc="Splits",
             position=0,
-            disable=self.disable_tqdm,
+            disable=False,
         ):
             contexts = [sample.context for sample in split]
             max_new_tokens = split[0].generation_size  # could be none
@@ -240,7 +379,21 @@ class LiteLLMClient(LightevalModel):
             num_samples = split[0].num_samples
             stop_sequence = requests[0].stop_sequence
 
-            responses = self.__call_api_parallel(contexts, return_logits, max_new_tokens, num_samples, stop_sequence)
+            # Build metadata for this batch
+            metadata_list = []
+            for i, sample in enumerate(split):
+                # Compute index within dataset from the subset indices
+                try:
+                    ordinal = split.indices[i]
+                except Exception:
+                    ordinal = i
+                metadata_list.append({
+                    "benchmark": sample.task_name,
+                    "index": ordinal + 1,
+                    "total": total_requests,
+                })
+
+            responses = self.__call_api_parallel(contexts, return_logits, max_new_tokens, num_samples, stop_sequence, metadata_list)
 
             for response in responses:
                 result: list[str] = [choice.message.content for choice in response.choices]
