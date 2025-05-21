@@ -41,6 +41,7 @@ class GenerationParameters(BaseModel, extra="forbid"):
     min_p: NonNegativeFloat | None = None  # vllm, transformers, sglang
     top_p: NonNegativeFloat | None = None  # vllm, transformers, tgi, litellm, sglang
     truncate_prompt: bool | None = None  # vllm, tgi
+    request_timeout: NonNegativeInt | None = None  # litellm
 
     # response format to be followed by the model,
     # more info here https://platform.openai.com/docs/api-reference/chat/create#chat-create-response_format
@@ -108,6 +109,7 @@ class GenerationParameters(BaseModel, extra="forbid"):
             "seed": self.seed,
             "repetition_penalty": self.repetition_penalty,
             "frequency_penalty": self.frequency_penalty,
+            "request_timeout": 3600,  # 60 minutes timeout
         }
         return {k: v for k, v in args.items() if v is not None}
 

@@ -141,6 +141,7 @@ class LiteLLMClient(LightevalModel):
                     "n": num_samples,
                     "caching": True,
                     "api_key": self.api_key,
+                    "request_timeout": 3600,  # 60 minutes timeout
                 }
                 if any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]):
                     logger.warning("OpenAI o-series models do not support temperature, top_p, stop sequence. Disabling.")
