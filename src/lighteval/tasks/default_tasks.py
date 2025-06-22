@@ -13612,11 +13612,7 @@ musr_generative_murder_mysteries = LightevalTaskConfig(
     few_shots_split=None,
     few_shots_select=None,
     generation_size=32768,  # needed for reasoning models like R1
-    metric=[
-        Metrics.gpqa_instruct_pass_at_1_1n,
-        Metrics.gpqa_instruct_pass_at_1_4n,
-        Metrics.gpqa_instruct_pass_at_1_8n,
-    ],
+    metric=[Metrics.gpqa_instruct_metric],
     stop_sequence=[],  # no stop sequence, will use eos token
     trust_dataset=True,
     version=1,
@@ -13632,11 +13628,7 @@ musr_generative_object_placements = LightevalTaskConfig(
     few_shots_split=None,
     few_shots_select=None,
     generation_size=32768,  # needed for reasoning models like R1
-    metric=[
-        Metrics.gpqa_instruct_pass_at_1_1n,
-        Metrics.gpqa_instruct_pass_at_1_4n,
-        Metrics.gpqa_instruct_pass_at_1_8n,
-    ],
+    metric=[Metrics.gpqa_instruct_metric],
     stop_sequence=[],  # no stop sequence, will use eos token
     trust_dataset=True,
     version=1,
@@ -13652,11 +13644,7 @@ musr_generative_team_allocation = LightevalTaskConfig(
     few_shots_split=None,
     few_shots_select=None,
     generation_size=32768,  # needed for reasoning models like R1
-    metric=[
-        Metrics.gpqa_instruct_pass_at_1_1n,
-        Metrics.gpqa_instruct_pass_at_1_4n,
-        Metrics.gpqa_instruct_pass_at_1_8n,
-    ],
+    metric=[Metrics.gpqa_instruct_metric],
     stop_sequence=[],  # no stop sequence, will use eos token
     trust_dataset=True,
     version=1,
