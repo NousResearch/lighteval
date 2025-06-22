@@ -25,6 +25,7 @@ import time
 import json
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
+import threading
 
 from tqdm import tqdm
 from rich import print as rprint
@@ -56,13 +57,14 @@ console = Console()
 if is_litellm_available():
     import litellm
     from litellm import encode
-    from litellm.caching.caching import Cache
+    from litellm.caching.caching import Cache, disable_cache
     from litellm.utils import ModelResponse
 
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
     logging.getLogger("LiteLLM").handlers.clear()
 
     litellm.cache = Cache(type="disk")
+    litellm.disable_cache()
 
 
 class LiteLLMModelConfig(ModelConfig):
@@ -70,6 +72,7 @@ class LiteLLMModelConfig(ModelConfig):
     provider: str | None = None
     base_url: str | None = None
     api_key: str | None = None
+    split_n_size: int = 32
 
 
 class LiteLLMClient(LightevalModel):
@@ -91,6 +94,7 @@ class LiteLLMClient(LightevalModel):
         self.base_url = config.base_url
         self.api_key = config.api_key
         self.generation_parameters = config.generation_parameters
+        self.split_n_size = config.split_n_size
 
         self.API_MAX_RETRY = 5
         self.API_RETRY_SLEEP = 3
@@ -101,6 +105,10 @@ class LiteLLMClient(LightevalModel):
         self.pairwise_tokenization = False
         litellm.drop_params = True
         litellm.set_verbose = False
+
+        # Initialize throttle lock and timestamp for rate limiting
+        self._throttle_lock = threading.Lock()
+        self._last_request_time = 0.0
 
     def _prepare_stop_sequence(self, stop_sequence):
         """Prepare and validate stop sequence."""
@@ -122,6 +130,27 @@ class LiteLLMClient(LightevalModel):
 
     def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata=None):
         """Make API call with retries."""
+        # If requested, split num_samples into chunks of size split_n_size
+        if self.split_n_size and num_samples and num_samples > self.split_n_size:
+            chunk_size = self.split_n_size
+            full_chunks = num_samples // chunk_size
+            remainder = num_samples % chunk_size
+            sizes = [chunk_size] * full_chunks + ([remainder] if remainder else [])
+            aggregated_choices = []
+            max_workers = min(len(sizes), self.CONCURENT_CALLS)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        self.__call_api, prompt, return_logits, max_new_tokens, sz, stop_sequence, metadata
+                    )
+                    for sz in sizes
+                ]
+                for future in futures:
+                    resp = future.result()
+                    aggregated_choices.extend(resp.choices)
+            agg = ModelResponse()
+            agg.choices = aggregated_choices
+            return agg
         response = ModelResponse()
         for attempt in range(self.API_MAX_RETRY):
             try:
@@ -139,9 +168,10 @@ class LiteLLMClient(LightevalModel):
                     "logprobs": return_logits if self.provider == "openai" else None,
                     "base_url": self.base_url,
                     "n": num_samples,
-                    "caching": True,
+                    "caching": False,
+                    "cache": {"no-cache": True},
                     "api_key": self.api_key,
-                    "request_timeout": 3600,  # 60 minutes timeout
+                    "request_timeout": 900,  # 15 minutes timeout
                 }
                 if any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]):
                     logger.warning("OpenAI o-series models do not support temperature, top_p, stop sequence. Disabling.")
@@ -216,6 +246,14 @@ class LiteLLMClient(LightevalModel):
                 ))
                 pprint(request_info["generation_parameters"])
                 
+                # Throttle to ensure no two completion calls occur within 50ms
+                with self._throttle_lock:
+                    now = time.time()
+                    elapsed = now - self._last_request_time
+                    wait_time = 0.05 - elapsed
+                    if wait_time > 0:
+                        time.sleep(wait_time)
+                    self._last_request_time = time.time()
                 response = litellm.completion(**kwargs)
 
                 # If response is empty, retry without caching (maybe the error is recoverable and solved with a retry)

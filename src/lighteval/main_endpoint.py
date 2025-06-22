@@ -334,6 +334,9 @@ def litellm(
     job_id: Annotated[
         int, Option(help="Optional job id for future refenrence.", rich_help_panel=HELP_PANEL_NAME_3)
     ] = 0,
+    split_n_size: Annotated[
+        int, Option(help="Maximum size of each sub-request when splitting num_samples", rich_help_panel=HELP_PANEL_NAME_3)
+    ] = 32,
 ):
     """
     Evaluate models using LiteLLM as backend.
@@ -365,6 +368,9 @@ def litellm(
     else:
         metric_options = None
         model_config = LiteLLMModelConfig.from_args(model_args)
+
+    # Propagate split_n_size option to model configuration
+    model_config.split_n_size = split_n_size
 
     pipeline_params = PipelineParameters(
         launcher_type=parallelism_manager,
