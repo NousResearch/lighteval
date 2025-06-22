@@ -127,6 +127,7 @@ class EvaluationTracker:
         public: bool = False,
         nanotron_run_info: "GeneralArgs" = None,
         wandb: bool = False,
+        email: str | None = None,
     ) -> None:
         """Creates all the necessary loggers for evaluation tracking."""
         self.details_logger = DetailsLogger()
@@ -154,6 +155,7 @@ class EvaluationTracker:
         self.nanotron_run_info = nanotron_run_info
 
         self.public = public
+        self.email = email
 
         if wandb is True:
             import wandb
@@ -249,6 +251,10 @@ class EvaluationTracker:
                 results=self.metrics_logger.metric_aggregated, details=self.details_logger.compiled_details
             )
 
+        # Send email notification if email is provided
+        if self.email:
+            self.send_email_notification(results_dict)
+
     def push_to_wandb(self, results_dict: dict, details_datasets: dict) -> None:
         # reformat the results key to replace ':' with '/'
         results_dict = {k.replace(":", "/"): v for k, v in results_dict["results"].items()}
@@ -257,6 +263,171 @@ class EvaluationTracker:
             {**results_dict},
         )
         self.wandb_run.finish()
+
+    def send_email_notification(self, results_dict: dict) -> None:
+        """Send email notification when evaluation completes."""
+        if not self.email:
+            return
+
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+        import json
+        
+        try:
+            # Extract task information from the results
+            tasks = list(results_dict["results"].keys())
+            task_names = [task.split("|")[1] if "|" in task else task for task in tasks]
+            
+            # Format results for display
+            formatted_results = []
+            for task, metrics in results_dict["results"].items():
+                task_display = task.split("|")[1] if "|" in task else task
+                formatted_results.append(f"**{task_display}**:")
+                for metric, value in metrics.items():
+                    if isinstance(value, (int, float)):
+                        formatted_results.append(f"  - {metric}: {value:.4f}")
+                    else:
+                        formatted_results.append(f"  - {metric}: {value}")
+                formatted_results.append("")
+            
+            # Create email content
+            model_name = self.general_config_logger.model_name
+            subject = f"✅ Evaluation Complete: {model_name} on {', '.join(task_names[:3])}"
+            if len(task_names) > 3:
+                subject += f" (+{len(task_names)-3} more)"
+            
+            body = f"""
+Evaluation completed successfully!
+
+**Model:** {model_name}
+**Tasks:** {', '.join(task_names)}
+**Output Directory:** {self.output_dir}
+
+**Results:**
+{chr(10).join(formatted_results)}
+
+**Summary:**
+- Total tasks: {len(tasks)}
+- Evaluation completed at: {results_dict['config_general']['end_time']}
+
+You can find detailed results in: {self.output_dir}
+            """.strip()
+            
+            logger.info(f"Sending email notification to {self.email}")
+            
+            # Try multiple email sending methods
+            success = False
+            
+            # Method 1: Try using sendmail (if available)
+            try:
+                import subprocess
+                import tempfile
+                import os
+                
+                # Create a temporary file with the email content
+                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:
+                    f.write(f"To: {self.email}\n")
+                    f.write(f"Subject: {subject}\n")
+                    f.write("Content-Type: text/plain; charset=utf-8\n\n")
+                    f.write(body)
+                    temp_file = f.name
+                
+                # Try to send using sendmail
+                result = subprocess.run(
+                    ['sendmail', self.email],
+                    input=open(temp_file, 'r').read(),
+                    text=True,
+                    capture_output=True,
+                    timeout=30
+                )
+                
+                # Clean up temp file
+                os.unlink(temp_file)
+                
+                if result.returncode == 0:
+                    success = True
+                    logger.info("Email sent successfully via sendmail")
+                else:
+                    logger.warning(f"Sendmail failed with return code {result.returncode}: {result.stderr}")
+                    
+            except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
+                logger.debug(f"Sendmail method failed: {e}")
+            
+            # Method 2: Try using a webhook service (ntfy.sh)
+            if not success:
+                try:
+                    import urllib.request
+                    import urllib.parse
+                    
+                    # Use ntfy.sh as a simple notification service
+                    topic = f"lighteval_{self.email.replace('@', '_').replace('.', '_')}"
+                    url = f"https://ntfy.sh/{topic}"
+                    
+                    # Truncate body if too long for ntfy
+                    notification_body = body
+                    if len(notification_body) > 4000:
+                        notification_body = notification_body[:3900] + "...\n\n[Message truncated]"
+                    
+                    data = notification_body.encode('utf-8')
+                    req = urllib.request.Request(
+                        url,
+                        data=data,
+                        headers={
+                            'Title': subject,
+                            'Priority': 'default',
+                            'Tags': 'computer,evaluation'
+                        }
+                    )
+                    
+                    with urllib.request.urlopen(req, timeout=10) as response:
+                        if response.status == 200:
+                            success = True
+                            logger.info(f"Notification sent successfully via ntfy.sh to topic: {topic}")
+                            logger.info(f"Subscribe to notifications at: https://ntfy.sh/{topic}")
+                        else:
+                            logger.warning(f"ntfy.sh request failed with status {response.status}")
+                            
+                except Exception as e:
+                    logger.debug(f"ntfy.sh method failed: {e}")
+            
+            # Method 3: Try environment-based SMTP
+            if not success:
+                try:
+                    smtp_server = os.environ.get('SMTP_SERVER', 'localhost')
+                    smtp_port = int(os.environ.get('SMTP_PORT', '587'))
+                    smtp_user = os.environ.get('SMTP_USER')
+                    smtp_pass = os.environ.get('SMTP_PASS')
+                    from_email = os.environ.get('FROM_EMAIL', smtp_user or 'lighteval@localhost')
+                    
+                    if smtp_user and smtp_pass:
+                        msg = MIMEMultipart()
+                        msg['From'] = from_email
+                        msg['To'] = self.email
+                        msg['Subject'] = subject
+                        msg.attach(MIMEText(body, 'plain'))
+                        
+                        server = smtplib.SMTP(smtp_server, smtp_port)
+                        server.starttls()
+                        server.login(smtp_user, smtp_pass)
+                        server.send_message(msg)
+                        server.quit()
+                        
+                        success = True
+                        logger.info("Email sent successfully via SMTP")
+                    else:
+                        logger.debug("SMTP credentials not found in environment variables")
+                        
+                except Exception as e:
+                    logger.debug(f"SMTP method failed: {e}")
+            
+            if not success:
+                logger.warning(f"Failed to send email notification to {self.email}. "
+                             "Consider setting up sendmail, ntfy.sh, or SMTP environment variables "
+                             "(SMTP_SERVER, SMTP_PORT, SMTP_USER, SMTP_PASS, FROM_EMAIL)")
+                
+        except Exception as e:
+            logger.error(f"Error sending email notification: {e}")
 
     def save_results(self, date_id: str, results_dict: dict):
         output_dir_results = Path(self.output_dir) / "results" / self.general_config_logger.model_name

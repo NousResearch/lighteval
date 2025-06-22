@@ -1842,6 +1842,38 @@ def musr(line, task_name: str = None):
     return Doc(task_name=task_name, query=query, choices=choices, gold_index=line["answer_index"])
 
 
+def musr_generative(line, task_name: str = None):
+    """Prompt template adapted from gpqa_instruct for reasoning-focused evaluation of MuSR tasks"""
+    choices = ast.literal_eval(line["choices"])
+    
+    query_template = "Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of {choice_letters}. Think step by step before answering.\n\n{narrative}\n\n{question}\n\n{choices_formatted}"
+    
+    # Format choices with letters A, B, C, D...
+    choices_formatted = ""
+    choice_letters = []
+    for i, choice in enumerate(choices):
+        letter = LETTER_INDICES[i]
+        choice_letters.append(letter)
+        choices_formatted += f"{letter}) {choice}\n"
+    
+    choice_letters_str = ", ".join(choice_letters)
+    
+    query = query_template.format(
+        narrative=line["narrative"],
+        question=line["question"],
+        choices_formatted=choices_formatted.strip(),
+        choice_letters=choice_letters_str
+    )
+
+    return Doc(
+        task_name=task_name,
+        query=query,
+        choices=choice_letters,
+        gold_index=line["answer_index"],
+        instruction=query,
+    )
+
+
 def mutual(line, task_name: str = None):
     def clean(text):
         replace_list = [(" '", "'"), (" \n", "\n"), ("\n ", "\n"), (" n't", "n't"), ("`` ", '"'), ("''", '"')]
