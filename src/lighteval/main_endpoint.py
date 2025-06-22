@@ -337,6 +337,9 @@ def litellm(
     split_n_size: Annotated[
         int, Option(help="Maximum size of each sub-request when splitting num_samples", rich_help_panel=HELP_PANEL_NAME_3)
     ] = 32,
+    email: Annotated[
+        Optional[str], Option(help="Email address to send notification when evaluation completes.", rich_help_panel=HELP_PANEL_NAME_2)
+    ] = None,
 ):
     """
     Evaluate models using LiteLLM as backend.
@@ -356,6 +359,7 @@ def litellm(
         public=public_run,
         hub_results_org=results_org,
         wandb=wandb,
+        email=email,
     )
 
     parallelism_manager = ParallelismManager.NONE

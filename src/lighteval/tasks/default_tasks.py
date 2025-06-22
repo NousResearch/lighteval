@@ -13601,6 +13601,66 @@ musr_team_allocation = LightevalTaskConfig(
     trust_dataset=True,
     version=0,
 )
+musr_generative_murder_mysteries = LightevalTaskConfig(
+    name="musr_generative:murder_mysteries",
+    suite=["lighteval"],
+    prompt_function=prompt.musr_generative,
+    hf_repo="TAUR-Lab/MuSR",
+    hf_subset="default",
+    hf_avail_splits=["murder_mysteries"],
+    evaluation_splits=["murder_mysteries"],
+    few_shots_split=None,
+    few_shots_select=None,
+    generation_size=32768,  # needed for reasoning models like R1
+    metric=[
+        Metrics.gpqa_instruct_pass_at_1_1n,
+        Metrics.gpqa_instruct_pass_at_1_4n,
+        Metrics.gpqa_instruct_pass_at_1_8n,
+    ],
+    stop_sequence=[],  # no stop sequence, will use eos token
+    trust_dataset=True,
+    version=1,
+)
+musr_generative_object_placements = LightevalTaskConfig(
+    name="musr_generative:object_placements",
+    suite=["lighteval"],
+    prompt_function=prompt.musr_generative,
+    hf_repo="TAUR-Lab/MuSR",
+    hf_subset="default",
+    hf_avail_splits=["object_placements"],
+    evaluation_splits=["object_placements"],
+    few_shots_split=None,
+    few_shots_select=None,
+    generation_size=32768,  # needed for reasoning models like R1
+    metric=[
+        Metrics.gpqa_instruct_pass_at_1_1n,
+        Metrics.gpqa_instruct_pass_at_1_4n,
+        Metrics.gpqa_instruct_pass_at_1_8n,
+    ],
+    stop_sequence=[],  # no stop sequence, will use eos token
+    trust_dataset=True,
+    version=1,
+)
+musr_generative_team_allocation = LightevalTaskConfig(
+    name="musr_generative:team_allocation",
+    suite=["lighteval"],
+    prompt_function=prompt.musr_generative,
+    hf_repo="TAUR-Lab/MuSR",
+    hf_subset="default",
+    hf_avail_splits=["team_allocation"],
+    evaluation_splits=["team_allocation"],
+    few_shots_split=None,
+    few_shots_select=None,
+    generation_size=32768,  # needed for reasoning models like R1
+    metric=[
+        Metrics.gpqa_instruct_pass_at_1_1n,
+        Metrics.gpqa_instruct_pass_at_1_4n,
+        Metrics.gpqa_instruct_pass_at_1_8n,
+    ],
+    stop_sequence=[],  # no stop sequence, will use eos token
+    trust_dataset=True,
+    version=1,
+)
 mutual_lighteval = LightevalTaskConfig(
     name="mutual",
     suite=["lighteval"],
