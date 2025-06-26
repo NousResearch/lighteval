@@ -35,21 +35,21 @@ from lighteval.models.endpoints.inference_providers_model import (
     InferenceProvidersClient,
     InferenceProvidersModelConfig,
 )
-from lighteval.models.endpoints.openai_model import OpenAIClient, OpenAIModelConfig
 from lighteval.models.endpoints.tgi_model import ModelClient, TGIModelConfig
 from lighteval.models.litellm_model import LiteLLMClient, LiteLLMModelConfig
 from lighteval.models.sglang.sglang_model import SGLangModel, SGLangModelConfig
 from lighteval.models.transformers.adapter_model import AdapterModel, AdapterModelConfig
 from lighteval.models.transformers.delta_model import DeltaModel, DeltaModelConfig
 from lighteval.models.transformers.transformers_model import TransformersModel, TransformersModelConfig
-from lighteval.models.vllm.vllm_model import VLLMModel, VLLMModelConfig
+from lighteval.models.transformers.vlm_transformers_model import VLMTransformersModel, VLMTransformersModelConfig
+from lighteval.models.utils import ModelConfig
+from lighteval.models.vllm.vllm_model import AsyncVLLMModel, VLLMModel, VLLMModelConfig
 from lighteval.utils.imports import (
     NO_LITELLM_ERROR_MSG,
     NO_SGLANG_ERROR_MSG,
     NO_TGI_ERROR_MSG,
     NO_VLLM_ERROR_MSG,
     is_litellm_available,
-    is_openai_available,
     is_sglang_available,
     is_tgi_available,
     is_vllm_available,
@@ -60,35 +60,18 @@ logger = logging.getLogger(__name__)
 
 
 def load_model(  # noqa: C901
-    config: Union[
-        TransformersModelConfig,
-        AdapterModelConfig,
-        DeltaModelConfig,
-        TGIModelConfig,
-        InferenceEndpointModelConfig,
-        DummyModelConfig,
-        VLLMModelConfig,
-        CustomModelConfig,
-        OpenAIModelConfig,
-        LiteLLMModelConfig,
-        SGLangModelConfig,
-        InferenceProvidersModelConfig,
-    ],
-) -> Union[TransformersModel, AdapterModel, DeltaModel, ModelClient, DummyModel]:
-    """Will load either a model from an inference server or a model from a checkpoint, depending
-    on the config type.
+    config: ModelConfig,
+) -> LightevalModel:
+    """
+    Load a model from a checkpoint, depending on the config type.
 
     Args:
-        args (Namespace): arguments passed to the program
-        accelerator (Accelerator): Accelerator that will be used by the model
+        config (ModelConfig): configuration of the model to load
 
     Raises:
-        ValueError: If you try to load a model from an inference server and from a checkpoint at the same time
         ValueError: If you try to have both the multichoice continuations start with a space and not to start with a space
-        ValueError: If you did not specify a base model when using delta weights or adapter weights
-
     Returns:
-        Union[TransformersModel, AdapterModel, DeltaModel, ModelClient]: The model that will be evaluated
+        LightevalModel: The model that will be evaluated
     """
     # Inference server loading
     if isinstance(config, TGIModelConfig):
@@ -98,6 +81,9 @@ def load_model(  # noqa: C901
         return load_model_with_inference_endpoints(config)
 
     if isinstance(config, TransformersModelConfig):
+        return load_model_with_accelerate_or_default(config)
+
+    if isinstance(config, VLMTransformersModelConfig):
         return load_model_with_accelerate_or_default(config)
 
     if isinstance(config, DummyModelConfig):
@@ -111,9 +97,6 @@ def load_model(  # noqa: C901
 
     if isinstance(config, SGLangModelConfig):
         return load_sglang_model(config)
-
-    if isinstance(config, OpenAIModelConfig):
-        return load_openai_model(config)
 
     if isinstance(config, LiteLLMModelConfig):
         return load_litellm_model(config)
@@ -138,15 +121,6 @@ def load_litellm_model(config: LiteLLMModelConfig):
         raise ImportError(NO_LITELLM_ERROR_MSG)
 
     model = LiteLLMClient(config)
-    return model
-
-
-def load_openai_model(config: OpenAIModelConfig):
-    if not is_openai_available():
-        raise ImportError()
-
-    model = OpenAIClient(config)
-
     return model
 
 
@@ -186,7 +160,9 @@ def load_model_with_inference_endpoints(config: Union[InferenceEndpointModelConf
 
 
 def load_model_with_accelerate_or_default(
-    config: Union[AdapterModelConfig, TransformersModelConfig, DeltaModelConfig],
+    config: Union[
+        AdapterModelConfig, TransformersModelConfig, DeltaModelConfig, VLLMModelConfig, VLMTransformersModelConfig
+    ],
 ):
     if isinstance(config, AdapterModelConfig):
         model = AdapterModel(config=config)
@@ -195,8 +171,12 @@ def load_model_with_accelerate_or_default(
     elif isinstance(config, VLLMModelConfig):
         if not is_vllm_available():
             raise ImportError(NO_VLLM_ERROR_MSG)
-        model = VLLMModel(config=config)
-        return model
+        if config.is_async:
+            model = AsyncVLLMModel(config=config)
+        else:
+            model = VLLMModel(config=config)
+    elif isinstance(config, VLMTransformersModelConfig):
+        model = VLMTransformersModel(config=config)
     else:
         model = TransformersModel(config=config)
 

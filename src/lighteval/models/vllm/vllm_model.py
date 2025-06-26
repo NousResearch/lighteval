@@ -20,11 +20,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import asyncio
 import gc
 import itertools
 import logging
 import os
-from typing import Optional
+from typing import Coroutine, Optional
 
 import torch
 from pydantic import NonNegativeFloat, NonNegativeInt, PositiveInt
@@ -32,17 +33,11 @@ from tqdm import tqdm
 
 from lighteval.data import GenerativeTaskDataset, LoglikelihoodDataset
 from lighteval.models.abstract_model import LightevalModel, ModelInfo
-from lighteval.models.model_output import (
-    GenerativeResponse,
-    LoglikelihoodResponse,
-)
+from lighteval.models.model_output import ModelResponse
 from lighteval.models.utils import ModelConfig, _simplify_name
-from lighteval.tasks.requests import (
-    GreedyUntilRequest,
-    LoglikelihoodRequest,
-)
+from lighteval.tasks.prompt_manager import PromptManager
+from lighteval.tasks.requests import Doc
 from lighteval.utils.imports import is_vllm_available
-from lighteval.utils.utils import as_list
 
 
 logger = logging.getLogger(__name__)
@@ -51,9 +46,13 @@ logger = logging.getLogger(__name__)
 if is_vllm_available():
     import ray
     from more_itertools import distribute
-    from vllm import LLM, SamplingParams
-    from vllm.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
+    from vllm import LLM, RequestOutput, SamplingParams
+    from vllm.distributed.parallel_state import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+    )
     from vllm.transformers_utils.tokenizer import get_tokenizer
+    from vllm.v1.engine.async_llm import AsyncEngineArgs, AsyncLLM
 
     logging.getLogger("vllm").propagate = True
     logging.getLogger("vllm").handlers.clear()
@@ -61,11 +60,12 @@ if is_vllm_available():
     logging.getLogger("ray").propagate = True
     logging.getLogger("ray").handlers.clear()
 else:
-    LLM = None
-    SamplingParams = None
-    get_tokenizer = None
-    ray = None
-    distribute = None
+    from unittest.mock import Mock
+
+    LLM = SamplingParams = get_tokenizer = ray = distribute = destroy_distributed_environment = (
+        destroy_model_parallel
+    ) = Mock()
+    AsyncLLM = AsyncEngineArgs = RequestOutput = Mock()
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -73,6 +73,75 @@ STARTING_BATCH_SIZE = 512
 
 
 class VLLMModelConfig(ModelConfig):
+    """
+    Configuration class for VLLM inference engine.
+
+    This configuration is used to load and configure models using the VLLM inference engine,
+    which provides high-performance inference for large language models with features like
+    PagedAttention, continuous batching, and efficient memory management.
+
+    vllm doc: https://docs.vllm.ai/en/v0.7.1/serving/engine_args.html
+
+    Attributes:
+        model_name (str):
+            HuggingFace Hub model ID or path to the model to load.
+        revision (str):
+            Git revision of the model. Defaults to "main".
+        dtype (str):
+            Data type for model weights. Defaults to "bfloat16". Options: "float16", "bfloat16", "float32".
+        tensor_parallel_size (PositiveInt):
+            Number of GPUs to use for tensor parallelism. Defaults to 1.
+        data_parallel_size (PositiveInt):
+            Number of GPUs to use for data parallelism. Defaults to 1.
+        pipeline_parallel_size (PositiveInt):
+            Number of GPUs to use for pipeline parallelism. Defaults to 1.
+        gpu_memory_utilization (NonNegativeFloat):
+            Fraction of GPU memory to use. Lower this if running out of memory. Defaults to 0.9.
+        max_model_length (PositiveInt | None):
+            Maximum sequence length for the model. If None, automatically inferred.
+            Reduce this if encountering OOM issues (4096 is usually sufficient).
+        quantization (str | None):
+            Quantization method.
+        load_format (str | None):
+            The format of the model weights to load. choices: auto, pt, safetensors, npcache, dummy, tensorizer, sharded_state, gguf, bitsandbytes, mistral, runai_streamer.
+        swap_space (PositiveInt):
+            CPU swap space size in GiB per GPU. Defaults to 4.
+        seed (NonNegativeInt):
+            Random seed for reproducibility. Defaults to 1234.
+        trust_remote_code (bool):
+            Whether to trust remote code when loading models. Defaults to False.
+        add_special_tokens (bool):
+            Whether to add special tokens during tokenization. Defaults to True.
+        multichoice_continuations_start_space (bool):
+            Whether to add a space before multiple choice continuations. Defaults to True.
+        pairwise_tokenization (bool):
+            Whether to tokenize context and continuation separately for loglikelihood evals. Defaults to False.
+        max_num_seqs (PositiveInt):
+            Maximum number of sequences per iteration. Controls batch size at prefill stage. Defaults to 128.
+        max_num_batched_tokens (PositiveInt):
+            Maximum number of tokens per batch. Defaults to 2048.
+        subfolder (str | None):
+            Subfolder within the model repository. Defaults to None.
+        use_chat_template (bool):
+            Whether to use chat templates for conversation-style prompts. Defaults to False.
+        is_async (bool):
+            Whether to use the async version of VLLM. Defaults to False.
+
+    Example:
+        ```python
+        config = VLLMModelConfig(
+            model_name="meta-llama/Llama-3.1-8B-Instruct",
+            tensor_parallel_size=2,
+            gpu_memory_utilization=0.8,
+            max_model_length=4096,
+            generation_parameters=GenerationParameters(
+                temperature=0.7,
+                max_new_tokens=100
+            )
+        )
+        ```
+    """
+
     model_name: str
     revision: str = "main"  # revision of the model
     dtype: str = "bfloat16"
@@ -80,13 +149,14 @@ class VLLMModelConfig(ModelConfig):
     data_parallel_size: PositiveInt = 1  # how many GPUs to use for data parallelism
     pipeline_parallel_size: PositiveInt = 1  # how many GPUs to use for pipeline parallelism
     gpu_memory_utilization: NonNegativeFloat = 0.9  # lower this if you are running out of memory
-    max_model_length: PositiveInt | None = None  # maximum length of the model, ussually infered automatically. reduce this if you encouter OOM issues, 4096 is usually enough
+    max_model_length: PositiveInt | None = (
+        None  # maximum length of the model, ussually infered automatically. reduce this if you encouter OOM issues, 4096 is usually enough
+    )
     quantization: str | None = None
     load_format: str | None = None
     swap_space: PositiveInt = 4  # CPU swap space size (GiB) per GPU.
     seed: NonNegativeInt = 1234
     trust_remote_code: bool = False
-    use_chat_template: bool = False
     add_special_tokens: bool = True
     multichoice_continuations_start_space: bool = (
         True  # whether to add a space at the start of each continuation in multichoice generation
@@ -95,6 +165,8 @@ class VLLMModelConfig(ModelConfig):
     max_num_seqs: PositiveInt = 128  # maximum number of sequences per iteration; This variable and `max_num_batched_tokens` effectively control the batch size at prefill stage. See https://github.com/vllm-project/vllm/issues/2492 for detailed explaination.
     max_num_batched_tokens: PositiveInt = 2048  # maximum number of tokens per batch
     subfolder: str | None = None
+    use_chat_template: bool = False
+    is_async: bool = False  # Whether to use the async version or sync version of the model
 
 
 class VLLMModel(LightevalModel):
@@ -124,6 +196,8 @@ class VLLMModel(LightevalModel):
 
         self.model_info = ModelInfo(model_name=self.model_name, model_sha=self.model_sha)
         self.pairwise_tokenization = config.pairwise_tokenization
+
+        self.prompt_manager = PromptManager(self.use_chat_template, self.tokenizer, config.system_prompt)
 
     @property
     def tokenizer(self):
@@ -204,16 +278,15 @@ class VLLMModel(LightevalModel):
             config.model_name,
             tokenizer_mode="auto",
             trust_remote_code=config.trust_remote_code,
-            tokenizer_revision=config.revision,
+            revision=config.revision,
         )
         tokenizer.pad_token = tokenizer.eos_token
         return tokenizer
 
     def greedy_until(
         self,
-        requests: list[GreedyUntilRequest],
-        override_bs: Optional[int] = None,
-    ) -> list[GenerativeResponse]:
+        docs: list[Doc],
+    ) -> list[ModelResponse]:
         """
         Generates responses using a greedy decoding strategy until certain ending conditions are met.
 
@@ -224,11 +297,7 @@ class VLLMModel(LightevalModel):
         Returns:
             list[GenerateReturn]: list of generated responses.
         """
-        for request in requests:
-            request.stop_sequence = as_list(request.stop_sequence) + [self.tokenizer.eos_token]
-            request.tokenized_context = self.tok_encode(request.context)
-
-        dataset = GenerativeTaskDataset(requests=requests, num_dataset_splits=self.DATASET_SPLITS)
+        dataset = GenerativeTaskDataset(requests=docs, num_dataset_splits=self.DATASET_SPLITS)
         results = []
 
         for split in tqdm(
@@ -245,13 +314,12 @@ class VLLMModel(LightevalModel):
                 # NOTE: we are assuming all items in a batch behave similarly (same
                 # stop_tokens and max_tokens genrated) which is not necessarily
                 # the case! Because of that we only use batch size of 1
-                stop_tokens = split[0].stop_sequence
+                stop_tokens = split[0].stop_sequences or []
 
             max_new_tokens = self._config.generation_parameters.max_new_tokens or split[0].generation_size
-            returns_logits = split[0].use_logits
             num_samples = split[0].num_samples
 
-            context = [sample.context for sample in split]
+            context = [self.prompt_manager.prepare_prompt(doc) for doc in split]
             tokenized = self.tokenizer(context, add_special_tokens=self.add_special_tokens)
 
             # The main question for this step is the following:
@@ -287,21 +355,19 @@ class VLLMModel(LightevalModel):
                 inputs=inputs,
                 max_new_tokens=max_new_tokens,
                 stop_tokens=stop_tokens,
-                returns_logits=returns_logits,
+                returns_logits=False,
                 num_samples=num_samples,
             )
 
-            for vllm_output in vllm_outputs:
+            for i, vllm_output in enumerate(vllm_outputs):
                 output_token_ids = [outputs.token_ids for outputs in vllm_output.outputs]
-                logprobs = [output.logprobs for output in vllm_output.outputs] or []
-                logprobs = [logprob[token_id].logprob for token_id, logprob in zip(output_token_ids[0], logprobs[0])]
                 result = [output.text for output in vllm_output.outputs]
                 input_token_ids = vllm_output.prompt_token_ids
 
-                cur_response = GenerativeResponse(
-                    result=result,
-                    logits=logprobs,
-                    generated_tokens=list(output_token_ids),
+                cur_response = ModelResponse(
+                    input=context[i],
+                    text=result,
+                    output_tokens=list(output_token_ids),
                     input_tokens=input_token_ids,
                 )
                 results.append(cur_response)
@@ -316,7 +382,7 @@ class VLLMModel(LightevalModel):
         returns_logits: Optional[bool] = False,
         num_samples: int = 1,
         generate: bool = True,
-    ) -> list[GenerativeResponse]:
+    ) -> list:
         """Contains the actual logic of the generation."""
         sampling_params = SamplingParams(**self._config.generation_parameters.to_vllm_dict())
 
@@ -325,7 +391,10 @@ class VLLMModel(LightevalModel):
             sampling_params.max_tokens = max_new_tokens
             sampling_params.stop = stop_tokens
             sampling_params.logprobs = 1 if returns_logits else 0
-
+            if num_samples > 1 and sampling_params.temperature == 0:
+                raise ValueError(
+                    "num_samples > 1 is not supported with temperature=0, please set temperature > 0 or use non sampling metrics."
+                )
         else:
             sampling_params.temperature = 0
             sampling_params.prompt_logprobs = 1
@@ -368,55 +437,232 @@ class VLLMModel(LightevalModel):
 
         return outputs
 
-    def loglikelihood(
-        self, requests: list[LoglikelihoodRequest], override_bs: Optional[int] = None
-    ) -> list[LoglikelihoodResponse]:
-        for request in requests:
-            if request.context == "":
-                request.tokenized_context = [self.tokenizer.eos_token_id]
-                request.tokenized_continuation = self.tok_encode(request.choice)
-            else:
-                # The following line is mandatory for compatibility with the harness
-                request.tokenized_context, request.tokenized_continuation = self.tok_encode_pair(
-                    request.context, request.choice, pairwise=self.pairwise_tokenization
-                )
-        return self._loglikelihood_tokens(requests, override_bs=override_bs)
+    def loglikelihood(self, docs: list[Doc]) -> list[ModelResponse]:
+        return self._loglikelihood_tokens(docs)
 
     def _loglikelihood_tokens(
         self,
-        requests: list[LoglikelihoodRequest],
-        override_bs: int = -1,
-        return_bool_score: bool = True,
-        rolling: bool = False,
-    ) -> list[LoglikelihoodResponse]:
-        dataset = LoglikelihoodDataset(requests=requests, num_dataset_splits=1)
+        docs: list[Doc],
+    ) -> list[ModelResponse]:
+        dataset = LoglikelihoodDataset(requests=docs, num_dataset_splits=1)
         res = []
 
         for split in tqdm(dataset.splits_iterator()):
-            # the last token is an eos token, so we don't need to add it
-            inputs = [sample.tokenized_context + sample.tokenized_continuation for sample in split]
+            contexts = [self.prompt_manager.prepare_prompt(doc) for doc in split]
+
+            inputs = []
+            tokenized_continuations_batch = []
+            tokenized_contexts_batch = []
+
+            for context, doc in zip(contexts, split):
+                tokenized_contexts, tokenized_continuations = self.tok_encode_pair(
+                    context, doc.choices, pairwise=self.pairwise_tokenization
+                )
+                for tokenized_context, tokenized_continuation in zip(tokenized_contexts, tokenized_continuations):
+                    inputs.append(tokenized_context + tokenized_continuation)
+                    tokenized_continuations_batch.append(tokenized_continuation)
+                    tokenized_contexts_batch.append(tokenized_context)
+
             # Left truncate the inputs to the maximum length
             inputs = [input[-self.max_length :] for input in inputs]
             outputs = self._generate(inputs, generate=False)
 
-            for i, output in enumerate(outputs):
-                input = split[i]
-                continuation_logprobs = []
-                for token, logprobs in zip(input.tokenized_continuation[::-1], output.prompt_logprobs[::-1]):
-                    continuation_logprobs.append(logprobs[token])
-                bool_score = all(logprob.rank == 1 for logprob in continuation_logprobs)
-                continuation_logprobs = [logprob.logprob for logprob in continuation_logprobs]
-                answer = LoglikelihoodResponse(
-                    input_tokens=input.tokenized_context + input.tokenized_continuation,
-                    generated_tokens=input.tokenized_continuation,
-                    result=(sum(continuation_logprobs), bool_score if return_bool_score else None),
+            flat_index = 0
+            for i, doc in enumerate(split):
+                outputs_doc = outputs[flat_index : flat_index + len(doc.choices)]
+                tokenized_continuations_doc = tokenized_continuations_batch[flat_index : flat_index + len(doc.choices)]
+                tokenized_contexts_doc = tokenized_contexts_batch[flat_index : flat_index + len(doc.choices)]
+                logprobs_doc = []
+                argmax_doc = []
+                output_tokens_doc = []
+                input_tokens_doc = []
+
+                for output, context, continuation in zip(
+                    outputs_doc, tokenized_contexts_doc, tokenized_continuations_doc
+                ):
+                    continuation_logprobs = []
+                    for token, logprobs in zip(continuation[::-1], output.prompt_logprobs[::-1]):
+                        continuation_logprobs.append(logprobs[token])
+
+                    bool_score = all(logprob.rank == 1 for logprob in continuation_logprobs)
+                    continuation_logprobs = [logprob.logprob for logprob in continuation_logprobs]
+                    continuation_logprobs = sum(continuation_logprobs)
+                    logprobs_doc.append(continuation_logprobs)
+                    argmax_doc.append(bool_score)
+                    output_tokens_doc.append(continuation)
+                    input_tokens_doc.append(context)
+
+                answer = ModelResponse(
+                    input=contexts[i],
+                    input_tokens=input_tokens_doc,
+                    output_tokens=output_tokens_doc,
+                    logprobs=logprobs_doc,
+                    argmax_logits_eq_gold=argmax_doc,
                 )
                 res.append(answer)
+                flat_index += len(doc.choices)
 
         return dataset.get_original_order(res)
 
-    def loglikelihood_rolling():
-        pass
+    def loglikelihood_rolling(self, docs: list[Doc]) -> list[ModelResponse]:
+        raise NotImplementedError()
 
-    def loglikelihood_single_token():
-        pass
+
+class AsyncVLLMModel(VLLMModel):
+    """VLLM models which deploy async natively (no ray). Supports DP and PP/TP but not batch size > 1"""
+
+    DATASET_SPLITS = 1
+    is_async = True
+
+    def cleanup(self):
+        gc.collect()
+        destroy_distributed_environment()
+        torch.cuda.empty_cache()
+
+    def _create_auto_model(self, config: VLLMModelConfig):
+        """
+        Creates an instance of the async vllm model loaded from HF. Requires using the v1 of VLLM.
+
+        Returns:
+            AsyncLLM: The created async VLLM instance
+        """
+        self.model_args = {
+            "model": config.model_name,
+            "gpu_memory_utilization": config.gpu_memory_utilization,
+            "revision": config.revision + (f"/{config.subfolder}" if config.subfolder is not None else ""),
+            "dtype": config.dtype,
+            "trust_remote_code": config.trust_remote_code,
+            "tensor_parallel_size": config.tensor_parallel_size,
+            "data_parallel_size": config.data_parallel_size,
+            "pipeline_parallel_size": config.pipeline_parallel_size,
+            "max_model_len": self._max_length,
+            "swap_space": 4,
+            "seed": int(config.seed),
+            "max_num_seqs": int(config.max_num_seqs),
+            "max_num_batched_tokens": int(config.max_num_batched_tokens),
+            "enforce_eager": True,
+        }
+
+        if config.data_parallel_size > 1:
+            self._batch_size = "auto"
+
+        model = AsyncLLM.from_engine_args(AsyncEngineArgs(**self.model_args))
+
+        # If the max_length can't get extracted from the config, it will be inferred from the model
+        if self._max_length is None:
+            self._max_length = model.model_config.max_seq_len_to_capture
+
+        return model
+
+    async def _async_one_item(
+        self,
+        index: int,
+        doc: Doc,
+        generative: bool,
+    ) -> Coroutine[None, list, str]:
+        """Contains the actual logic of the generation."""
+        sampling_params = SamplingParams(**self._config.generation_parameters.to_vllm_dict())
+
+        if not generative:
+            sampling_params.temperature = 0
+            sampling_params.prompt_logprobs = 1
+            sampling_params.max_tokens = 1
+            sampling_params.detokenize = False
+            prompt = self.prompt_manager.prepare_prompt(doc) + doc.choice
+            index_str = f"logprob_{index}"
+        else:
+            sampling_params.n = doc.num_samples
+            if sampling_params.n > 1:
+                # Todo clementine: investigate more
+                logger.warning(
+                    "Careful, there can be unexpected behavior when using sampling evals with the async vllm model"
+                )
+            sampling_params.max_tokens = self._config.generation_parameters.max_new_tokens or doc.generation_size
+            sampling_params.stop = [] if self.use_chat_template else doc.stop_sequences
+            sampling_params.logprobs = int(doc.use_logits)
+            prompt = self.prompt_manager.prepare_prompt(doc)
+            index_str = f"generative_{index}"
+
+        generator = self.model.generate(request_id=index_str, prompt=prompt, sampling_params=sampling_params)
+        try:
+            while output := await anext(generator):
+                continue
+        except StopAsyncIteration:
+            pass
+
+        return output
+
+    async def _async_batch(self, docs: list[Doc], generative: bool) -> list:
+        processed_requests = [
+            self._async_one_item(index=index, doc=doc, generative=generative) for index, doc in enumerate(docs)
+        ]
+        results = await asyncio.gather(*processed_requests)
+        return results
+
+    async def greedy_until(
+        self,
+        docs: list[Doc],
+    ) -> list[ModelResponse]:
+        """
+        Generates responses using a greedy decoding strategy until certain ending conditions are met.
+
+        Args:
+            requests (list[Request]): list of requests containing the context and ending conditions.
+
+        Returns:
+            list[GenerateReturn]: list of generated responses.
+        """
+        results = []
+
+        responses = await self._async_batch(docs=docs, generative=True)
+
+        for response in responses:
+            output_token_ids = [outputs.token_ids for outputs in response.outputs]
+            full_logprobs = [output.logprobs for output in response.outputs] or []
+            logprobs = [logprob[token_id].logprob for token_id, logprob in zip(output_token_ids[0], full_logprobs[0])]
+            result = [output.text for output in response.outputs]
+            input_token_ids = response.prompt_token_ids
+
+            cur_response = ModelResponse(
+                text=result,
+                logprobs=logprobs,
+                output_tokens=list(output_token_ids),
+                input_tokens=input_token_ids,
+            )
+            results.append(cur_response)
+
+        return results
+
+    async def loglikelihood(
+        self,
+        docs: list[Doc],
+    ) -> list[ModelResponse]:
+        """
+        Generates responses using a greedy decoding strategy until certain ending conditions are met and
+        stores the logprobs.
+
+        Args:
+            requests (list[Request]): list of requests containing the context and ending conditions.
+
+        Returns:
+            list[LoglikelihoodResponse]: list of generated responses.
+        """
+        results = []
+
+        responses = await self._async_batch(docs=docs, generative=False)
+
+        for response, input in zip(responses, docs):
+            continuation_logprobs = []
+            for token, logprobs in zip(input.tokenized_continuation[::-1], response.prompt_logprobs[::-1]):
+                continuation_logprobs.append(logprobs[token])
+            bool_score = all(logprob.rank == 1 for logprob in continuation_logprobs)
+            continuation_logprobs = [logprob.logprob for logprob in continuation_logprobs]
+            answer = ModelResponse(
+                input_tokens=input.tokenized_context + input.tokenized_continuation,
+                output_tokens=input.tokenized_continuation,
+                logprobs=sum(continuation_logprobs),
+                argmax_logits_eq_gold=bool_score,
+            )
+            results.append(answer)
+
+        return results

@@ -50,12 +50,6 @@ def inference_endpoint(
         ),
     ] = False,
     # === Common parameters ===
-    use_chat_template: Annotated[
-        bool, Option(help="Use chat template for evaluation.", rich_help_panel=HELP_PANEL_NAME_4)
-    ] = False,
-    system_prompt: Annotated[
-        Optional[str], Option(help="Use system prompt for evaluation.", rich_help_panel=HELP_PANEL_NAME_4)
-    ] = None,
     dataset_loading_processes: Annotated[
         int, Option(help="Number of processes to use for dataset loading.", rich_help_panel=HELP_PANEL_NAME_1)
     ] = 1,
@@ -72,6 +66,13 @@ def inference_endpoint(
     output_dir: Annotated[
         str, Option(help="Output directory for evaluation results.", rich_help_panel=HELP_PANEL_NAME_2)
     ] = "results",
+    results_path_template: Annotated[
+        str | None,
+        Option(
+            help="Template path for where to save the results, you have access to 3 variables, `output_dir`, `org` and `model`. for example a template can be `'{output_dir}/1234/{org}+{model}'`",
+            rich_help_panel=HELP_PANEL_NAME_2,
+        ),
+    ] = None,
     push_to_hub: Annotated[
         bool, Option(help="Push results to the huggingface hub.", rich_help_panel=HELP_PANEL_NAME_2)
     ] = False,
@@ -111,6 +112,7 @@ def inference_endpoint(
 
     evaluation_tracker = EvaluationTracker(
         output_dir=output_dir,
+        results_path_template=results_path_template,
         save_details=save_details,
         push_to_hub=push_to_hub,
         push_to_tensorboard=push_to_tensorboard,
@@ -133,8 +135,6 @@ def inference_endpoint(
         custom_tasks_directory=custom_tasks,
         num_fewshot_seeds=num_fewshot_seeds,
         max_samples=max_samples,
-        use_chat_template=use_chat_template,
-        system_prompt=system_prompt,
         load_responses_from_details_date_id=load_responses_from_details_date_id,
     )
     pipeline = Pipeline(
@@ -163,12 +163,6 @@ def tgi(
     ],
     tasks: Annotated[str, Argument(help="Comma-separated list of tasks to evaluate on.")],
     # === Common parameters ===
-    use_chat_template: Annotated[
-        bool, Option(help="Use chat template for evaluation.", rich_help_panel=HELP_PANEL_NAME_4)
-    ] = False,
-    system_prompt: Annotated[
-        Optional[str], Option(help="Use system prompt for evaluation.", rich_help_panel=HELP_PANEL_NAME_4)
-    ] = None,
     dataset_loading_processes: Annotated[
         int, Option(help="Number of processes to use for dataset loading.", rich_help_panel=HELP_PANEL_NAME_1)
     ] = 1,
@@ -185,6 +179,13 @@ def tgi(
     output_dir: Annotated[
         str, Option(help="Output directory for evaluation results.", rich_help_panel=HELP_PANEL_NAME_2)
     ] = "results",
+    results_path_template: Annotated[
+        str | None,
+        Option(
+            help="Template path for where to save the results, you have access to 3 variables, `output_dir`, `org` and `model`. for example a template can be `'{output_dir}/1234/{org}+{model}'`",
+            rich_help_panel=HELP_PANEL_NAME_2,
+        ),
+    ] = None,
     push_to_hub: Annotated[
         bool, Option(help="Push results to the huggingface hub.", rich_help_panel=HELP_PANEL_NAME_2)
     ] = False,
@@ -227,6 +228,7 @@ def tgi(
 
     evaluation_tracker = EvaluationTracker(
         output_dir=output_dir,
+        results_path_template=results_path_template,
         save_details=save_details,
         push_to_hub=push_to_hub,
         push_to_tensorboard=push_to_tensorboard,
@@ -250,8 +252,6 @@ def tgi(
         custom_tasks_directory=custom_tasks,
         num_fewshot_seeds=num_fewshot_seeds,
         max_samples=max_samples,
-        use_chat_template=use_chat_template,
-        system_prompt=system_prompt,
         load_responses_from_details_date_id=load_responses_from_details_date_id,
     )
     pipeline = Pipeline(
@@ -283,12 +283,6 @@ def litellm(
     ],
     tasks: Annotated[str, Argument(help="Comma-separated list of tasks to evaluate on.")],
     # === Common parameters ===
-    use_chat_template: Annotated[
-        bool, Option(help="Use chat template for evaluation.", rich_help_panel=HELP_PANEL_NAME_4)
-    ] = False,
-    system_prompt: Annotated[
-        Optional[str], Option(help="Use system prompt for evaluation.", rich_help_panel=HELP_PANEL_NAME_4)
-    ] = None,
     dataset_loading_processes: Annotated[
         int, Option(help="Number of processes to use for dataset loading.", rich_help_panel=HELP_PANEL_NAME_1)
     ] = 1,
@@ -305,6 +299,13 @@ def litellm(
     output_dir: Annotated[
         str, Option(help="Output directory for evaluation results.", rich_help_panel=HELP_PANEL_NAME_2)
     ] = "results",
+    results_path_template: Annotated[
+        str | None,
+        Option(
+            help="Template path for where to save the results, you have access to 3 variables, `output_dir`, `org` and `model`. for example a template can be `'{output_dir}/1234/{org}+{model}'`",
+            rich_help_panel=HELP_PANEL_NAME_2,
+        ),
+    ] = None,
     push_to_hub: Annotated[
         bool, Option(help="Push results to the huggingface hub.", rich_help_panel=HELP_PANEL_NAME_2)
     ] = False,
@@ -353,6 +354,7 @@ def litellm(
 
     evaluation_tracker = EvaluationTracker(
         output_dir=output_dir,
+        results_path_template=results_path_template,
         save_details=save_details,
         push_to_hub=push_to_hub,
         push_to_tensorboard=push_to_tensorboard,
@@ -383,8 +385,6 @@ def litellm(
         custom_tasks_directory=custom_tasks,
         num_fewshot_seeds=num_fewshot_seeds,
         max_samples=max_samples,
-        use_chat_template=use_chat_template,
-        system_prompt=system_prompt,
         load_responses_from_details_date_id=load_responses_from_details_date_id,
     )
     pipeline = Pipeline(
@@ -417,9 +417,6 @@ def inference_providers(
     ],
     tasks: Annotated[str, Argument(help="Comma-separated list of tasks to evaluate on.")],
     # === Common parameters ===
-    system_prompt: Annotated[
-        Optional[str], Option(help="Use system prompt for evaluation.", rich_help_panel=HELP_PANEL_NAME_4)
-    ] = None,
     dataset_loading_processes: Annotated[
         int, Option(help="Number of processes to use for dataset loading.", rich_help_panel=HELP_PANEL_NAME_1)
     ] = 1,
@@ -433,6 +430,13 @@ def inference_providers(
     output_dir: Annotated[
         str, Option(help="Output directory for evaluation results.", rich_help_panel=HELP_PANEL_NAME_2)
     ] = "results",
+    results_path_template: Annotated[
+        str | None,
+        Option(
+            help="Template path for where to save the results, you have access to 3 variables, `output_dir`, `org` and `model`. for example a template can be `'{output_dir}/1234/{org}+{model}'`",
+            rich_help_panel=HELP_PANEL_NAME_2,
+        ),
+    ] = None,
     push_to_hub: Annotated[
         bool, Option(help="Push results to the huggingface hub.", rich_help_panel=HELP_PANEL_NAME_2)
     ] = False,
@@ -464,7 +468,7 @@ def inference_providers(
     ] = 0,
 ):
     """
-    Evaluate models using LiteLLM as backend.
+    Evaluate models using HuggingFace's inference providers as backend.
     """
 
     from lighteval.logging.evaluation_tracker import EvaluationTracker
@@ -475,6 +479,7 @@ def inference_providers(
 
     evaluation_tracker = EvaluationTracker(
         output_dir=output_dir,
+        results_path_template=results_path_template,
         save_details=save_details,
         push_to_hub=push_to_hub,
         push_to_tensorboard=push_to_tensorboard,
@@ -483,14 +488,12 @@ def inference_providers(
         wandb=wandb,
     )
 
-    # TODO (nathan): better handling of model_args
     parallelism_manager = ParallelismManager.NONE
 
     if model_args.endswith(".yaml"):
         model_config = InferenceProvidersModelConfig.from_path(model_args)
     else:
-        model_args_dict: dict = {k.split("=")[0]: k.split("=")[1] if "=" in k else True for k in model_args.split(",")}
-        model_config = InferenceProvidersModelConfig(**model_args_dict)
+        model_config = InferenceProvidersModelConfig.from_args(model_args)
 
     pipeline_params = PipelineParameters(
         launcher_type=parallelism_manager,
@@ -499,8 +502,6 @@ def inference_providers(
         custom_tasks_directory=custom_tasks,
         num_fewshot_seeds=num_fewshot_seeds,
         max_samples=max_samples,
-        use_chat_template=True,
-        system_prompt=system_prompt,
         load_responses_from_details_date_id=None,
     )
     pipeline = Pipeline(
