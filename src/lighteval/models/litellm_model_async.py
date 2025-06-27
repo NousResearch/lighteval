@@ -20,14 +20,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import asyncio
 import logging
-import time
 import json
-from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
-import threading
 
-from tqdm import tqdm
 from rich import print as rprint
 from rich.pretty import pprint
 from rich.panel import Panel
@@ -48,7 +45,7 @@ console = Console()
 
 if is_litellm_available():
     import litellm
-    from litellm import encode
+    from litellm import encode, acompletion
     from litellm.caching.caching import Cache, disable_cache
     from litellm.utils import ModelResponse as LitellmModelResponse
 
@@ -62,12 +59,18 @@ else:
 
     litellm = Mock()
     encode = Mock()
+    acompletion = Mock()
     LitellmModelResponse = Mock()
 
+try:
+    from tqdm.asyncio import tqdm as async_tqdm
+except ImportError:
+    from tqdm import tqdm as async_tqdm
 
-class LiteLLMModelConfig(ModelConfig):
+
+class AsyncLiteLLMModelConfig(ModelConfig):
     """
-    Configuration class for LiteLLM unified API client.
+    Configuration class for async LiteLLM unified API client.
 
     This configuration is used to connect to various LLM providers through the LiteLLM
     unified API. LiteLLM provides a consistent interface to multiple providers including
@@ -88,13 +91,16 @@ class LiteLLMModelConfig(ModelConfig):
         api_key (str | None):
             API key for authentication. If None, reads from environment variables.
             Environment variable names are provider-specific (e.g., OPENAI_API_KEY).
+        parallel_calls_count (int):
+            Maximum number of concurrent API calls. Defaults to 50.
 
     Example:
         ```python
-        config = LiteLLMModelConfig(
+        config = AsyncLiteLLMModelConfig(
             model_name="gpt-4",
             provider="openai",
             base_url="https://api.openai.com/v1",
+            parallel_calls_count=20,
             generation_parameters=GenerationParameters(
                 temperature=0.7,
                 max_new_tokens=100
@@ -108,11 +114,13 @@ class LiteLLMModelConfig(ModelConfig):
     base_url: str | None = None
     api_key: str | None = None
     split_n_size: int = 32
+    parallel_calls_count: int = 50
 
 
-class LiteLLMClient(LightevalModel):
+class AsyncLiteLLMClient(LightevalModel):
     _DEFAULT_MAX_LENGTH: int = 4096
     DATASET_SPLITS = 1  # API-based models don't need dataset splitting like local models
+    is_async = True  # Enable async mode
 
     def __init__(self, config) -> None:
         """
@@ -131,11 +139,14 @@ class LiteLLMClient(LightevalModel):
         self.api_key = config.api_key
         self.generation_parameters = config.generation_parameters
         self.split_n_size = config.split_n_size
+        self.parallel_calls_count = config.parallel_calls_count
 
         self.API_MAX_RETRY = 5
         self.API_RETRY_SLEEP = 3
         self.API_RETRY_MULTIPLIER = 2
-        self.CONCURENT_CALLS = 100  # 100 leads to hitting Anthropic rate limits
+        
+        # Create semaphore for concurrency control
+        self.semaphore = asyncio.Semaphore(self.parallel_calls_count)
 
         self._tokenizer = encode
         self.pairwise_tokenization = False
@@ -144,10 +155,6 @@ class LiteLLMClient(LightevalModel):
         self.prompt_manager = PromptManager(
             use_chat_template=True, tokenizer=self.tokenizer, system_prompt=config.system_prompt
         )
-
-        # Initialize throttle lock and timestamp for rate limiting
-        self._throttle_lock = threading.Lock()
-        self._last_request_time = 0.0
 
     def _prepare_stop_sequence(self, stop_sequence):
         """Prepare and validate stop sequence."""
@@ -167,33 +174,34 @@ class LiteLLMClient(LightevalModel):
             max_new_tokens = min(max_new_tokens * 10, 32000)
         return max_new_tokens
 
-    def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata=None):
-        """Make API call with retries."""
+    async def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata=None):
+        """Make async API call with retries."""
         # If requested, split num_samples into chunks of size split_n_size
         if self.split_n_size and num_samples and num_samples > self.split_n_size:
             chunk_size = self.split_n_size
             full_chunks = num_samples // chunk_size
             remainder = num_samples % chunk_size
             sizes = [chunk_size] * full_chunks + ([remainder] if remainder else [])
-            aggregated_choices = []
-            max_workers = min(len(sizes), self.CONCURENT_CALLS)
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [
-                    executor.submit(
-                        self.__call_api, prompt, return_logits, max_new_tokens, sz, stop_sequence, metadata
-                    )
-                    for sz in sizes
-                ]
-                for future in futures:
-                    resp = future.result()
-                    aggregated_choices.extend(resp.choices)
             
-            # Create a LiteLLM response with aggregated choices
-            agg = LitellmModelResponse()
+            # Create async tasks for each chunk
+            tasks = [
+                self.__call_api(prompt, return_logits, max_new_tokens, sz, stop_sequence, metadata)
+                for sz in sizes
+            ]
+            
+            # Wait for all chunks to complete
+            responses = await asyncio.gather(*tasks)
+            
+            # Aggregate choices from all responses
+            aggregated_choices = []
+            for resp in responses:
+                aggregated_choices.extend(resp.choices)
+            
+            agg = ModelResponse()
             agg.choices = aggregated_choices
-            agg.usage = resp.usage if 'resp' in locals() else None  # Use last response's usage
             return agg
-        response = LitellmModelResponse()
+
+        response = ModelResponse()
         for attempt in range(self.API_MAX_RETRY):
             try:
                 stop_sequence = self._prepare_stop_sequence(stop_sequence)
@@ -268,14 +276,15 @@ class LiteLLMClient(LightevalModel):
                     base_meta = f"{metadata.get('benchmark', '')} {idx}/{total}"
                 else:
                     base_meta = None
+                    
                 # Print the request in a panel with rich formatting
                 if base_meta:
-                    request_title = f"LiteLLM API Request — {base_meta} — attempt {attempt+1}/{self.API_MAX_RETRY}"
+                    request_title = f"Async LiteLLM API Request — {base_meta} — attempt {attempt+1}/{self.API_MAX_RETRY}"
                 else:
-                    request_title = "LiteLLM API Request"
+                    request_title = "Async LiteLLM API Request"
                 console.print(Panel.fit(
                     "\n".join([
-                        "[bold cyan]LiteLLM Request Details:[/bold cyan]",
+                        "[bold cyan]Async LiteLLM Request Details:[/bold cyan]",
                         f"[green]Model:[/green] {request_info['model']}",
                         f"[green]Provider:[/green] {request_info['provider']}",
                         f"[green]O-series Model:[/green] {request_info['is_o_series_model']}",
@@ -293,32 +302,25 @@ class LiteLLMClient(LightevalModel):
                 ))
                 pprint(request_info["generation_parameters"])
                 
-                # Throttle to ensure no two completion calls occur within 50ms
-                with self._throttle_lock:
-                    now = time.time()
-                    elapsed = now - self._last_request_time
-                    wait_time = 0.05 - elapsed
-                    if wait_time > 0:
-                        time.sleep(wait_time)
-                    self._last_request_time = time.time()
-                response = litellm.completion(**kwargs)
+                # Make async API call using acompletion
+                response = await acompletion(**kwargs)
 
                 # If response is empty, retry without caching (maybe the error is recoverable and solved with a retry)
                 if response.choices[0].message.content is None:
                     kwargs["caching"] = False
                     logger.info("Response is empty, retrying without caching")
-                    response = litellm.completion(**kwargs)
+                    response = await acompletion(**kwargs)
                 
                 # Log response details
                 try:
                     # Use base_meta to build response title
                     if base_meta:
-                        response_title = f"LiteLLM API Response — {base_meta} — attempt {attempt+1}/{self.API_MAX_RETRY}"
+                        response_title = f"Async LiteLLM API Response — {base_meta} — attempt {attempt+1}/{self.API_MAX_RETRY}"
                     else:
-                        response_title = "LiteLLM API Response"
+                        response_title = "Async LiteLLM API Response"
                     console.print(Panel.fit(
                         "\n".join([
-                            "[bold cyan]LiteLLM Response Summary:[/bold cyan]",
+                            "[bold cyan]Async LiteLLM Response Summary:[/bold cyan]",
                             f"[green]Completion ID:[/green] {response.id}",
                             f"[green]Model:[/green] {response.model}",
                             f"[green]Created at:[/green] {response.created}",
@@ -342,15 +344,15 @@ class LiteLLMClient(LightevalModel):
                     )
                     if error_string in e.__dict__["message"]:
                         logger.warning(f"{error_string}. Returning empty response.")
-                        return LitellmModelResponse()
+                        return ModelResponse()
                 
                 # Use the same base_meta to build error title
                 if base_meta:
-                    error_title = f"LiteLLM API Error — {base_meta} — attempt {attempt+1}/{self.API_MAX_RETRY}"
+                    error_title = f"Async LiteLLM API Error — {base_meta} — attempt {attempt+1}/{self.API_MAX_RETRY}"
                 else:
-                    error_title = "LiteLLM API Error"
+                    error_title = "Async LiteLLM API Error"
                 console.print(Panel.fit(
-                    f"[bold red]Error in API Call (attempt {attempt + 1}/{self.API_MAX_RETRY}):[/bold red]\n{str(e)}",
+                    f"[bold red]Error in async API Call (attempt {attempt + 1}/{self.API_MAX_RETRY}):[/bold red]\n{str(e)}",
                     title=error_title,
                     border_style="red"
                 ))
@@ -359,35 +361,35 @@ class LiteLLMClient(LightevalModel):
                 
                 # Use the same base_meta to build error title for retry
                 if base_meta:
-                    error_title = f"LiteLLM API Error — {base_meta} — attempt {attempt+1}/{self.API_MAX_RETRY}"
+                    error_title = f"Async LiteLLM API Error — {base_meta} — attempt {attempt+1}/{self.API_MAX_RETRY}"
                 else:
-                    error_title = "LiteLLM API Error"
+                    error_title = "Async LiteLLM API Error"
                 console.print(Panel.fit(
-                    f"[bold red]Error in API Call (attempt {attempt + 1}/{self.API_MAX_RETRY}):[/bold red]\n{str(e)}\n\n" +
+                    f"[bold red]Error in async API Call (attempt {attempt + 1}/{self.API_MAX_RETRY}):[/bold red]\n{str(e)}\n\n" +
                     f"[yellow]Waiting {wait_time} seconds before retry...[/yellow]",
                     title=error_title,
                     border_style="red"
                 ))
                 
                 logger.warning(
-                    f"Error in API call: {e}, waiting {wait_time} seconds before retry {attempt + 1}/{self.API_MAX_RETRY}"
+                    f"Error in async API call: {e}, waiting {wait_time} seconds before retry {attempt + 1}/{self.API_MAX_RETRY}"
                 )
-                time.sleep(wait_time)
+                await asyncio.sleep(wait_time)
 
-        logger.error(f"API call failed after {self.API_MAX_RETRY} attempts, returning empty response.")
+        logger.error(f"Async API call failed after {self.API_MAX_RETRY} attempts, returning empty response.")
         # Use base_meta to build final failure title
         if base_meta:
-            failure_title = f"LiteLLM API Failure — {base_meta} — attempts {self.API_MAX_RETRY}"
+            failure_title = f"Async LiteLLM API Failure — {base_meta} — attempts {self.API_MAX_RETRY}"
         else:
-            failure_title = "LiteLLM API Failure"
+            failure_title = "Async LiteLLM API Failure"
         console.print(Panel.fit(
-            f"[bold red]API call failed after {self.API_MAX_RETRY} attempts[/bold red]\nReturning empty response.",
+            f"[bold red]Async API call failed after {self.API_MAX_RETRY} attempts[/bold red]\nReturning empty response.",
             title=failure_title,
             border_style="red"
         ))
-        return LitellmModelResponse()
+        return ModelResponse()
 
-    def __call_api_parallel(
+    async def __call_api_parallel(
         self,
         prompts,
         return_logits: bool | list[bool],
@@ -396,8 +398,6 @@ class LiteLLMClient(LightevalModel):
         stop_sequence: list[str] | None = None,
         metadata: list[dict] | None = None,
     ):
-        results = []
-
         return_logitss = [return_logits for _ in prompts] if not isinstance(return_logits, list) else return_logits
         max_new_tokenss = [max_new_tokens for _ in prompts] if not isinstance(max_new_tokens, list) else max_new_tokens
         num_sampless = [num_samples for _ in prompts] if not isinstance(num_samples, list) else num_samples
@@ -405,30 +405,30 @@ class LiteLLMClient(LightevalModel):
         assert (
             len(prompts) == len(return_logitss) == len(max_new_tokenss) == len(num_sampless) == len(stop_sequencess)
         ), (
-            f"Length of prompts, return_logitss, max_new_tokenss, num_sampless, stop_sequences, system_prompts should be the same but are {len(prompts)}, {len(return_logitss)}, {len(max_new_tokenss)}, {len(num_sampless)}, {len(stop_sequencess)}"
+            f"Length of prompts, return_logitss, max_new_tokenss, num_sampless, stop_sequences should be the same but are {len(prompts)}, {len(return_logitss)}, {len(max_new_tokenss)}, {len(num_sampless)}, {len(stop_sequencess)}"
         )
 
         # Align metadata list with prompts
         metadata_list = metadata if metadata is not None else [None] * len(prompts)
         assert len(prompts) == len(metadata_list), f"Length of prompts ({len(prompts)}) and metadata ({len(metadata_list)}) must be the same"
 
-        with ThreadPoolExecutor(self.CONCURENT_CALLS) as executor:
-            for entry in tqdm(
-                executor.map(
-                    self.__call_api,
-                    prompts,
-                    return_logitss,
-                    max_new_tokenss,
-                    num_sampless,
-                    stop_sequencess,
-                    metadata_list,
-                ),
-                total=len(prompts),
-            ):
-                results.append(entry)
+        # Create bounded async API call function
+        async def bounded_api_call(prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata):
+            async with self.semaphore:
+                return await self.__call_api(prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata)
+
+        # Create tasks for all API calls
+        tasks = [
+            bounded_api_call(prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata)
+            for prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata 
+            in zip(prompts, return_logitss, max_new_tokenss, num_sampless, stop_sequencess, metadata_list)
+        ]
+
+        # Wait for all tasks to complete with progress bar
+        results = await async_tqdm.gather(*tasks, desc="Async API Calls")
 
         if None in results:
-            raise ValueError("Some entries are not annotated due to errors in annotate_p, please inspect and retry.")
+            raise ValueError("Some entries are not annotated due to errors in async API calls, please inspect and retry.")
 
         return results
 
@@ -440,11 +440,10 @@ class LiteLLMClient(LightevalModel):
         Generates responses using a greedy decoding strategy until certain ending conditions are met.
 
         Args:
-            requests (list[Request]): list of requests containing the context and ending conditions.
-            override_bs (int, optional): Override the batch size for generation. Defaults to None.
+            docs (list[Doc]): list of requests containing the context and ending conditions.
 
         Returns:
-            list[GenerativeResponse]: list of generated responses.
+            list[ModelResponse]: list of generated responses.
         """
         # Note: LiteLLM doesn't need tokenized context like transformers models
         # since we send text directly to the API
@@ -452,59 +451,59 @@ class LiteLLMClient(LightevalModel):
         total_requests = dataset.total_size
         results = []
 
-        for split in tqdm(
-            dataset.splits_iterator(),
-            total=dataset.num_dataset_splits,
-            desc="Splits",
-            position=0,
-            disable=False,
-        ):
-            contexts = [self.prompt_manager.prepare_prompt_api(doc) for doc in dataset]
-            max_new_tokens = split[0].generation_size  # could be none
-            return_logits = split[0].use_logits
-            num_samples = split[0].num_samples
-            stop_sequence = split[0].stop_sequences
+        async def async_greedy_until():
+            nonlocal results
+            
+            for split in dataset.splits_iterator():
+                contexts = [self.prompt_manager.prepare_prompt_api(doc) for doc in split]
+                max_new_tokens = split[0].generation_size  # could be none
+                return_logits = split[0].use_logits
+                num_samples = split[0].num_samples
+                stop_sequence = split[0].stop_sequences
 
-            if num_samples > 1 and self.generation_parameters.temperature == 0:
-                raise ValueError(
-                    "num_samples > 1 is not supported with temperature=0, please set temperature > 0 or use non sampling metrics."
-                )
+                if num_samples > 1 and self.generation_parameters.temperature == 0:
+                    raise ValueError(
+                        "num_samples > 1 is not supported with temperature=0, please set temperature > 0 or use non sampling metrics."
+                    )
 
-            # Build metadata for this batch
-            metadata_list = []
-            for i, sample in enumerate(split):
-                # Compute index within dataset from the subset indices
-                try:
-                    ordinal = split.indices[i]
-                except Exception:
-                    ordinal = i
-                metadata_list.append({
-                    "benchmark": sample.task_name,
-                    "index": ordinal + 1,
-                    "total": total_requests,
-                })
+                # Build metadata for this batch
+                metadata_list = []
+                for i, sample in enumerate(split):
+                    # Compute index within dataset from the subset indices
+                    try:
+                        ordinal = split.indices[i]
+                    except Exception:
+                        ordinal = i
+                    metadata_list.append({
+                        "benchmark": sample.task_name,
+                        "index": ordinal + 1,
+                        "total": total_requests,
+                    })
 
-            responses = self.__call_api_parallel(contexts, return_logits, max_new_tokens, num_samples, stop_sequence, metadata_list)
+                responses = await self.__call_api_parallel(contexts, return_logits, max_new_tokens, num_samples, stop_sequence, metadata_list)
 
-            for response, context in zip(responses, contexts):
-                result: list[str] = [choice.message.content for choice in response.choices]
+                for response, context in zip(responses, contexts):
+                    result: list[str] = [choice.message.content for choice in response.choices]
 
-                # Extract token usage from LiteLLM response for logging
-                input_token_count = response.usage.prompt_tokens if response.usage else 0
-                output_token_count = response.usage.completion_tokens if response.usage else 0
-                
-                # Use token counts directly - logging only needs these for hashing
-                input_tokens = [input_token_count]  # Just the count for hashing
-                output_tokens = [[output_token_count]] if result[0] else [[0]]
+                    # Extract token usage from LiteLLM response for logging
+                    input_token_count = response.usage.prompt_tokens if response.usage else 0
+                    output_token_count = response.usage.completion_tokens if response.usage else 0
+                    
+                    # Use token counts directly - logging only needs these for hashing
+                    input_tokens = [input_token_count]  # Just the count for hashing
+                    output_tokens = [[output_token_count]] if result[0] else [[0]]
 
-                cur_response = ModelResponse(
-                    # In empty responses, the model should return an empty string instead of None
-                    text=result if result[0] else [""],
-                    input=context,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                )
-                results.append(cur_response)
+                    cur_response = ModelResponse(
+                        # In empty responses, the model should return an empty string instead of None
+                        text=result if result[0] else [""],
+                        input=context,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                    )
+                    results.append(cur_response)
+
+        # Run the async function
+        asyncio.run(async_greedy_until())
 
         return dataset.get_original_order(results)
 

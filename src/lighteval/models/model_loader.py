@@ -37,6 +37,7 @@ from lighteval.models.endpoints.inference_providers_model import (
 )
 from lighteval.models.endpoints.tgi_model import ModelClient, TGIModelConfig
 from lighteval.models.litellm_model import LiteLLMClient, LiteLLMModelConfig
+from lighteval.models.litellm_model_async import AsyncLiteLLMClient, AsyncLiteLLMModelConfig
 from lighteval.models.sglang.sglang_model import SGLangModel, SGLangModelConfig
 from lighteval.models.transformers.adapter_model import AdapterModel, AdapterModelConfig
 from lighteval.models.transformers.delta_model import DeltaModel, DeltaModelConfig
@@ -101,6 +102,9 @@ def load_model(  # noqa: C901
     if isinstance(config, LiteLLMModelConfig):
         return load_litellm_model(config)
 
+    if isinstance(config, AsyncLiteLLMModelConfig):
+        return load_alitellm_model(config)
+
     if isinstance(config, InferenceProvidersModelConfig):
         return load_inference_providers_model(config=config)
 
@@ -121,6 +125,14 @@ def load_litellm_model(config: LiteLLMModelConfig):
         raise ImportError(NO_LITELLM_ERROR_MSG)
 
     model = LiteLLMClient(config)
+    return model
+
+
+def load_alitellm_model(config: AsyncLiteLLMModelConfig):
+    if not is_litellm_available():
+        raise ImportError(NO_LITELLM_ERROR_MSG)
+
+    model = AsyncLiteLLMClient(config)
     return model
 
 
