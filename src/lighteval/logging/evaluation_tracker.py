@@ -30,6 +30,7 @@ from datetime import datetime
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import torch
 from datasets import Dataset, load_dataset
@@ -48,6 +49,39 @@ from lighteval.utils.utils import obj_to_markdown
 
 
 logger = logging.getLogger(__name__)
+
+
+def sanitize_filename(filename: str) -> str:
+    """Sanitize a filename by replacing filesystem-unsafe characters.
+    
+    Replaces pipe symbols with dashes, colons with double underscores, and other 
+    problematic characters to ensure valid filenames across different operating systems.
+    """
+    # Replace pipe symbols with dashes (since task names already use underscores)
+    sanitized = filename.replace('|', '-')
+    # Replace colons with double underscores (consistent with slash handling)
+    sanitized = sanitized.replace(':', '__')
+    # Replace other problematic characters with underscores
+    sanitized = re.sub(r'[<>"/\\?*]', '_', sanitized)
+    # Replace multiple consecutive underscores with single underscore
+    sanitized = re.sub(r'_+', '_', sanitized)
+    # Remove leading/trailing underscores and dashes
+    sanitized = sanitized.strip('_-')
+    return sanitized
+
+
+def sanitize_model_name_for_path(model_name: str) -> str:
+    """Sanitize a model name for use in file paths.
+    
+    For LiteLLM models, strips the 'openai/' prefix and replaces slashes
+    with double underscores for filesystem compatibility.
+    """
+    # Strip openai/ prefix for LiteLLM models to avoid deep nested paths
+    if model_name.startswith("openai/"):
+        model_name = model_name[7:]  # Remove "openai/"
+    
+    # Replace remaining slashes with double underscores for filesystem safety
+    return model_name.replace("/", "__")
 
 if is_nanotron_available():
     from nanotron.config import GeneralArgs  # type: ignore
@@ -97,6 +131,9 @@ class EvaluationTracker:
 
     Args:
         output_dir (`str`): Local folder path where you want results to be saved.
+        results_path_template (`str`, *optional*): template to use for the results output directory. for example,
+            `"{output_dir}/results_this_time_it_will_work/{org}_{model}"` will create a folder named `results` in the output directory
+            with the model name and the organization name.
         save_details (`bool`, defaults to True): If True, details are saved to the `output_dir`.
         push_to_hub (`bool`, defaults to False): If True, details are pushed to the hub.
             Results are pushed to `{hub_results_org}/details__{sanitized model_name}` for the model `model_name`, a public dataset,
@@ -119,6 +156,7 @@ class EvaluationTracker:
     def __init__(
         self,
         output_dir: str,
+        results_path_template: str | None = None,
         save_details: bool = True,
         push_to_hub: bool = False,
         push_to_tensorboard: bool = False,
@@ -153,6 +191,7 @@ class EvaluationTracker:
         self.tensorboard_repo = f"{hub_results_org}/tensorboard_logs"
         self.tensorboard_metric_prefix = tensorboard_metric_prefix
         self.nanotron_run_info = nanotron_run_info
+        self.results_path_template = results_path_template
 
         self.public = public
         self.email = email
@@ -193,10 +232,25 @@ class EvaluationTracker:
             for task_name, task_details in self.details_logger.details.items()
         }
 
+    def preview_outputs(self) -> None:
+        logger.info("Previewing outputs for your eval run, one per task")
+        from pprint import pprint
+
+        for task_name, task_details in self.details_logger.details.items():
+            logger.info(f"Task: {task_name}")
+            detail = task_details[0]
+            # We convert the detail to a markdown string
+            model_response = detail.model_response
+            metrics = detail.metric
+
+            pprint(model_response.text)
+            pprint(model_response.input)
+            pprint(metrics)
+
     def save(self) -> None:
         """Saves the experiment information and results to files, and to the hub if requested."""
         logger.info("Saving experiment tracker")
-        date_id = datetime.now().isoformat().replace(":", "-")
+        date_id = datetime.now(ZoneInfo("America/Los_Angeles")).isoformat().replace(":", "-")
 
         # We first prepare data to save
         config_general = asdict(self.general_config_logger)
@@ -430,15 +484,22 @@ You can find detailed results in: {self.output_dir}
             logger.error(f"Error sending email notification: {e}")
 
     def save_results(self, date_id: str, results_dict: dict):
-        output_dir_results = Path(self.output_dir) / "results" / self.general_config_logger.model_name
+        if self.results_path_template is not None:
+            org_model_parts = self.general_config_logger.model_name.split("/")
+            org = org_model_parts[0] if len(org_model_parts) >= 2 else ""
+            model = org_model_parts[1] if len(org_model_parts) >= 2 else org_model_parts[0]
+            output_dir = self.output_dir
+            output_dir_results = Path(self.results_path_template.format(output_dir=output_dir, org=org, model=model))
+        else:
+            output_dir_results = Path(self.output_dir) / "results" / sanitize_model_name_for_path(self.general_config_logger.model_name)
         self.fs.mkdirs(output_dir_results, exist_ok=True)
-        output_results_file = output_dir_results / f"results_{date_id}.json"
+        output_results_file = output_dir_results / f"{date_id}.json"
         logger.info(f"Saving results to {output_results_file}")
         with self.fs.open(output_results_file, "w") as f:
             f.write(json.dumps(results_dict, cls=EnhancedJSONEncoder, indent=2, ensure_ascii=False))
 
     def _get_details_sub_folder(self, date_id: str):
-        output_dir_details = Path(self.output_dir) / "details" / self.general_config_logger.model_name
+        output_dir_details = Path(self.output_dir) / "details" / sanitize_model_name_for_path(self.general_config_logger.model_name)
         if date_id in ["first", "last"]:
             # Get all folders in output_dir_details
             if not self.fs.exists(output_dir_details):
@@ -460,10 +521,25 @@ You can find detailed results in: {self.output_dir}
         date_id = output_dir_details_sub_folder.name  # Overwrite date_id in case of latest
         details_datasets = {}
         for file in self.fs.glob(str(output_dir_details_sub_folder / f"details_*_{date_id}.parquet")):
-            task_name = Path(file).stem.replace("details_", "").replace(f"_{date_id}", "")
-            if "|".join(task_name.split("|")[:-1]) not in task_names:
-                logger.info(f"Skipping {task_name} because it is not in the task_names list")
+            file_task_name = Path(file).stem.replace("details_", "").replace(f"_{date_id}", "")
+            
+            # Try to match against both original and sanitized task names
+            matched_task = None
+            for task_name in task_names:
+                if file_task_name == task_name or file_task_name == sanitize_filename(task_name):
+                    matched_task = task_name
+                    break
+                # Also check if it matches the task name without the last part (for backwards compatibility)
+                task_base = "|".join(task_name.split("|")[:-1])
+                if task_base == file_task_name or task_base == sanitize_filename(file_task_name):
+                    matched_task = task_name
+                    break
+            
+            if matched_task is None:
+                logger.info(f"Skipping {file_task_name} because it doesn't match any task in the task_names list")
                 continue
+            
+            task_name = matched_task
             dataset = load_dataset("parquet", data_files=file, split="train")
             details_datasets[task_name] = dataset
 
@@ -475,13 +551,37 @@ You can find detailed results in: {self.output_dir}
         return details_datasets
 
     def save_details(self, date_id: str, details_datasets: dict[str, Dataset]):
-        output_dir_details_sub_folder = self._get_details_sub_folder(date_id)
-        self.fs.mkdirs(output_dir_details_sub_folder, exist_ok=True)
-        logger.info(f"Saving details to {output_dir_details_sub_folder}")
-        for task_name, dataset in details_datasets.items():
-            output_file_details = output_dir_details_sub_folder / f"details_{task_name}_{date_id}.parquet"
+        # Save details to the same results directory, not a separate details directory
+        if self.results_path_template:
+            org_model_parts = self.general_config_logger.model_name.split("/")
+            org = org_model_parts[0] if len(org_model_parts) >= 2 else ""
+            model = org_model_parts[1] if len(org_model_parts) >= 2 else org_model_parts[0]
+            output_dir = self.output_dir
+            output_dir_results = Path(self.results_path_template.format(output_dir=output_dir, org=org, model=model))
+        else:
+            output_dir_results = Path(self.output_dir) / "results" / sanitize_model_name_for_path(self.general_config_logger.model_name)
+        
+        self.fs.mkdirs(output_dir_results, exist_ok=True)
+        logger.info(f"Saving details to {output_dir_results}")
+        
+        # Save details parquet with the same base name as the JSON results
+        output_file_details = output_dir_results / f"{date_id}.parquet"
+        
+        # Combine all task datasets into a single parquet file
+        if details_datasets:
+            # Add task_name column to each dataset and concatenate
+            combined_datasets = []
+            for task_name, dataset in details_datasets.items():
+                # Add task_name as a column
+                dataset_with_task = dataset.add_column("task_name", [task_name] * len(dataset))
+                combined_datasets.append(dataset_with_task)
+            
+            # Concatenate all datasets
+            from datasets import concatenate_datasets
+            combined_dataset = concatenate_datasets(combined_datasets)
+            
             with self.fs.open(str(output_file_details), "wb") as f:
-                dataset.to_parquet(f)
+                combined_dataset.to_parquet(f)
 
     def generate_final_dict(self) -> dict:
         """Aggregates and returns all the logger's experiment information in a dictionary.
@@ -511,7 +611,7 @@ You can find detailed results in: {self.output_dir}
         results_dict: dict,
     ) -> None:
         """Pushes the experiment details (all the model predictions for every step) to the hub."""
-        sanitized_model_name = self.general_config_logger.model_name.replace("/", "__")
+        sanitized_model_name = sanitize_model_name_for_path(self.general_config_logger.model_name)
 
         # "Default" detail names are the public detail names (same as results vs private-results)
         repo_id = f"{self.hub_results_org}/details_{sanitized_model_name}"
@@ -541,7 +641,7 @@ You can find detailed results in: {self.output_dir}
         results_dataset.to_parquet(f"{fsspec_repo_uri}/{result_file_base_name}.parquet")
 
         for task_name, dataset in details.items():
-            output_file_details = Path(date_id) / f"details_{task_name}_{date_id}.parquet"
+            output_file_details = Path(date_id) / f"details_{sanitize_filename(task_name)}_{date_id}.parquet"
             dataset.to_parquet(f"{fsspec_repo_uri}/{output_file_details}")
 
         self.recreate_metadata_card(repo_id)
@@ -738,7 +838,7 @@ You can find detailed results in: {self.output_dir}
         new_dictionary.update(results_dict)
         results_string = json.dumps(new_dictionary, indent=4)
 
-        # If we are pushing to the Oppen LLM Leaderboard, we'll store specific data in the model card.
+        # If we are pushing to the Open LLM Leaderboard, we'll store specific data in the model card.
         is_open_llm_leaderboard = repo_id.split("/")[0] == "open-llm-leaderboard"
         if is_open_llm_leaderboard:
             org_string = (
@@ -762,7 +862,7 @@ You can find detailed results in: {self.output_dir}
             f"To load the details from a run, you can for instance do the following:\n"
             f'```python\nfrom datasets import load_dataset\ndata = load_dataset("{repo_id}",\n\t"{sanitized_task}",\n\tsplit="train")\n```\n\n'
             f"## Latest results\n\n"
-            f'These are the [latest results from run {max_last_eval_date_results}]({last_results_file_path.replace("/resolve/", "/blob/")})'
+            f"These are the [latest results from run {max_last_eval_date_results}]({last_results_file_path.replace('/resolve/', '/blob/')})"
             f"(note that their might be results for other tasks in the repos if successive evals didn't cover the same tasks. "
             f'You find each in the results and the "latest" split for each eval):\n\n'
             f"```python\n{results_string}\n```",
@@ -854,7 +954,7 @@ You can find detailed results in: {self.output_dir}
         # We are doing parallel evaluations of multiple checkpoints and recording the steps not in order
         # This messes up with tensorboard, so the easiest is to rename files in the order of the checkpoints
         # See: https://github.com/tensorflow/tensorboard/issues/5958
-        # But tensorboardX don't let us control the prefix of the files (only the suffix), so we need to do it ourselves before commiting the files
+        # But tensorboardX don't let us control the prefix of the files (only the suffix), so we need to do it ourselves before committing the files
 
         # tb_context.close()  # flushes the unfinished write operations
         time.sleep(5)
