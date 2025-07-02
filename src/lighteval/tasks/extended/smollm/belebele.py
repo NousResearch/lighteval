@@ -27,14 +27,14 @@ from lighteval.metrics.dynamic_metrics import (
     IndicesExtractionConfig,
     multilingual_extractive_match_metric,
 )
-from lighteval.metrics.metrics import MetricCategory, MetricUseCase, SampleLevelMetric
+from lighteval.metrics.utils.metric_utils import SampleLevelMetric
 from lighteval.metrics.metrics_sample import (
     PassAtK,
 )
 from lighteval.tasks.default_prompts import LETTER_INDICES
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.multilingual.tasks import LangCodeLanguage, iso_639_3_ind_to_iso_639_3_macro
-from lighteval.tasks.requests import Doc
+from lighteval.tasks.requests import Doc, SamplingMethod
 from lighteval.utils.language import Language
 
 
@@ -98,9 +98,10 @@ def create_belebele_task(lang: str, en_prompt: bool = False) -> LightevalTaskCon
         few_shots_split=None,
         few_shots_select=None,
         generation_size=32768,  # needed for reasoning models like R1
-        metric=[
+        metrics=[
             SampleLevelMetric(
                 metric_name="pass@1:1_samples",
+                category=SamplingMethod.GENERATIVE,
                 sample_level_fn=PassAtK(
                     k=1,
                     n=1,
@@ -117,8 +118,6 @@ def create_belebele_task(lang: str, en_prompt: bool = False) -> LightevalTaskCon
                         precision=6,
                     ).sample_level_fn([ref], [pred], doc),
                 ).compute,
-                category=MetricCategory.GENERATIVE_SAMPLING,
-                use_case=MetricUseCase.REASONING,
                 corpus_level_fn=np.mean,
                 higher_is_better=True,
             )

@@ -27,13 +27,13 @@ from lighteval.metrics.dynamic_metrics import (
     IndicesExtractionConfig,
     multilingual_extractive_match_metric,
 )
-from lighteval.metrics.metrics import MetricCategory, MetricUseCase, SampleLevelMetric
+from lighteval.metrics.utils.metric_utils import SampleLevelMetric
 from lighteval.metrics.metrics_sample import (
     PassAtK,
 )
 from lighteval.tasks.default_prompts import LETTER_INDICES
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
-from lighteval.tasks.requests import Doc
+from lighteval.tasks.requests import Doc, SamplingMethod
 from lighteval.utils.language import Language
 
 
@@ -66,13 +66,14 @@ mmlu_pro = LightevalTaskConfig(
     few_shots_select=None,
     generation_size=30000,  # needed for reasoning models like R1
     stop_sequence=[],  # no stop sequence, will use eos token
-    metric=[
+    metrics=[
         SampleLevelMetric(
             metric_name="pass@1:1_samples",
+            category=SamplingMethod.GENERATIVE,
             sample_level_fn=PassAtK(
                 k=1,
                 n=1,
-                sample_scoring_function=lambda pred, ref, doc: multilingual_extractive_match_metric(
+                sample_scoring_function=lambda doc, model_response: multilingual_extractive_match_metric(
                     language=Language.ENGLISH,
                     gold_extraction_target=[
                         IndicesExtractionConfig(
@@ -85,10 +86,8 @@ mmlu_pro = LightevalTaskConfig(
                         )
                     ],
                     precision=6,
-                ).sample_level_fn([ref], [pred], doc),
+                ).sample_level_fn(doc, model_response),
             ).compute,
-            category=MetricCategory.GENERATIVE_SAMPLING,
-            use_case=MetricUseCase.REASONING,
             corpus_level_fn=np.mean,
             higher_is_better=True,
         )
