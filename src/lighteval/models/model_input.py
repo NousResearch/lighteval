@@ -43,6 +43,7 @@ class GenerationParameters(BaseModel, extra="forbid"):
     min_p: NonNegativeFloat | None = None  # vllm, transformers, sglang
     top_p: NonNegativeFloat | None = None  # vllm, transformers, tgi, litellm, sglang
     truncate_prompt: bool | None = None  # vllm, tgi
+    request_timeout: NonNegativeInt | None = None  # litellm
 
     # response format to be followed by the model,
     # more info here https://platform.openai.com/docs/api-reference/chat/create#chat-create-response_format
@@ -96,17 +97,21 @@ class GenerationParameters(BaseModel, extra="forbid"):
         """Selects relevant generation and sampling parameters for litellm models.
         Doc: https://docs.litellm.ai/docs/completion/input#input-params-1
 
+        Note: max_new_tokens is mapped to max_completion_tokens here, but will be
+        converted to max_tokens in the LiteLLMClient for non-o-series models.
+
         Returns:
             dict: The parameters to create a litellm.SamplingParams in the model config.
         """
         args = {
-            "max_completion_tokens": self.max_new_tokens,
+            "max_completion_tokens": self.max_new_tokens,  # Will be transformed to max_tokens for non-o-series models
             "stop": self.stop_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,
             "seed": self.seed,
             "repetition_penalty": self.repetition_penalty,
             "frequency_penalty": self.frequency_penalty,
+            "request_timeout": 3600,  # 60 minutes timeout
         }
         return {k: v for k, v in args.items() if v is not None}
 

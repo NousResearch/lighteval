@@ -30,6 +30,7 @@ from datetime import datetime
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import torch
 from datasets import Dataset, load_dataset
@@ -48,6 +49,39 @@ from lighteval.utils.utils import obj_to_markdown
 
 
 logger = logging.getLogger(__name__)
+
+
+def sanitize_filename(filename: str) -> str:
+    """Sanitize a filename by replacing filesystem-unsafe characters.
+    
+    Replaces pipe symbols with dashes, colons with double underscores, and other 
+    problematic characters to ensure valid filenames across different operating systems.
+    """
+    # Replace pipe symbols with dashes (since task names already use underscores)
+    sanitized = filename.replace('|', '-')
+    # Replace colons with double underscores (consistent with slash handling)
+    sanitized = sanitized.replace(':', '__')
+    # Replace other problematic characters with underscores
+    sanitized = re.sub(r'[<>"/\\?*]', '_', sanitized)
+    # Replace multiple consecutive underscores with single underscore
+    sanitized = re.sub(r'_+', '_', sanitized)
+    # Remove leading/trailing underscores and dashes
+    sanitized = sanitized.strip('_-')
+    return sanitized
+
+
+def sanitize_model_name_for_path(model_name: str) -> str:
+    """Sanitize a model name for use in file paths.
+    
+    For LiteLLM models, strips the 'openai/' prefix and replaces slashes
+    with double underscores for filesystem compatibility.
+    """
+    # Strip openai/ prefix for LiteLLM models to avoid deep nested paths
+    if model_name.startswith("openai/"):
+        model_name = model_name[7:]  # Remove "openai/"
+    
+    # Replace remaining slashes with double underscores for filesystem safety
+    return model_name.replace("/", "__")
 
 if is_nanotron_available():
     from nanotron.config import GeneralArgs  # type: ignore
@@ -131,6 +165,7 @@ class EvaluationTracker:
         public: bool = False,
         nanotron_run_info: "GeneralArgs" = None,
         wandb: bool = False,
+        email: str | None = None,
     ) -> None:
         """Creates all the necessary loggers for evaluation tracking."""
         self.details_logger = DetailsLogger()
@@ -159,6 +194,7 @@ class EvaluationTracker:
         self.results_path_template = results_path_template
 
         self.public = public
+        self.email = email
 
         if wandb is True:
             import wandb
@@ -196,10 +232,25 @@ class EvaluationTracker:
             for task_name, task_details in self.details_logger.details.items()
         }
 
+    def preview_outputs(self) -> None:
+        logger.info("Previewing outputs for your eval run, one per task")
+        from pprint import pprint
+
+        for task_name, task_details in self.details_logger.details.items():
+            logger.info(f"Task: {task_name}")
+            detail = task_details[0]
+            # We convert the detail to a markdown string
+            model_response = detail.model_response
+            metrics = detail.metric
+
+            pprint(model_response.text)
+            pprint(model_response.input)
+            pprint(metrics)
+
     def save(self) -> None:
         """Saves the experiment information and results to files, and to the hub if requested."""
         logger.info("Saving experiment tracker")
-        date_id = datetime.now().isoformat().replace(":", "-")
+        date_id = datetime.now(ZoneInfo("America/Los_Angeles")).isoformat().replace(":", "-")
 
         # We first prepare data to save
         config_general = asdict(self.general_config_logger)
@@ -254,6 +305,10 @@ class EvaluationTracker:
                 results=self.metrics_logger.metric_aggregated, details=self.details_logger.compiled_details
             )
 
+        # Send email notification if email is provided
+        if self.email:
+            self.send_email_notification(results_dict)
+
     def push_to_wandb(self, results_dict: dict, details_datasets: dict) -> None:
         # reformat the results key to replace ':' with '/'
         results_dict = {k.replace(":", "/"): v for k, v in results_dict["results"].items()}
@@ -263,6 +318,171 @@ class EvaluationTracker:
         )
         self.wandb_run.finish()
 
+    def send_email_notification(self, results_dict: dict) -> None:
+        """Send email notification when evaluation completes."""
+        if not self.email:
+            return
+
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+        import json
+        
+        try:
+            # Extract task information from the results
+            tasks = list(results_dict["results"].keys())
+            task_names = [task.split("|")[1] if "|" in task else task for task in tasks]
+            
+            # Format results for display
+            formatted_results = []
+            for task, metrics in results_dict["results"].items():
+                task_display = task.split("|")[1] if "|" in task else task
+                formatted_results.append(f"**{task_display}**:")
+                for metric, value in metrics.items():
+                    if isinstance(value, (int, float)):
+                        formatted_results.append(f"  - {metric}: {value:.4f}")
+                    else:
+                        formatted_results.append(f"  - {metric}: {value}")
+                formatted_results.append("")
+            
+            # Create email content
+            model_name = self.general_config_logger.model_name
+            subject = f"✅ Evaluation Complete: {model_name} on {', '.join(task_names[:3])}"
+            if len(task_names) > 3:
+                subject += f" (+{len(task_names)-3} more)"
+            
+            body = f"""
+Evaluation completed successfully!
+
+**Model:** {model_name}
+**Tasks:** {', '.join(task_names)}
+**Output Directory:** {self.output_dir}
+
+**Results:**
+{chr(10).join(formatted_results)}
+
+**Summary:**
+- Total tasks: {len(tasks)}
+- Evaluation completed at: {results_dict['config_general']['end_time']}
+
+You can find detailed results in: {self.output_dir}
+            """.strip()
+            
+            logger.info(f"Sending email notification to {self.email}")
+            
+            # Try multiple email sending methods
+            success = False
+            
+            # Method 1: Try using sendmail (if available)
+            try:
+                import subprocess
+                import tempfile
+                import os
+                
+                # Create a temporary file with the email content
+                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:
+                    f.write(f"To: {self.email}\n")
+                    f.write(f"Subject: {subject}\n")
+                    f.write("Content-Type: text/plain; charset=utf-8\n\n")
+                    f.write(body)
+                    temp_file = f.name
+                
+                # Try to send using sendmail
+                result = subprocess.run(
+                    ['sendmail', self.email],
+                    input=open(temp_file, 'r').read(),
+                    text=True,
+                    capture_output=True,
+                    timeout=30
+                )
+                
+                # Clean up temp file
+                os.unlink(temp_file)
+                
+                if result.returncode == 0:
+                    success = True
+                    logger.info("Email sent successfully via sendmail")
+                else:
+                    logger.warning(f"Sendmail failed with return code {result.returncode}: {result.stderr}")
+                    
+            except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
+                logger.debug(f"Sendmail method failed: {e}")
+            
+            # Method 2: Try using a webhook service (ntfy.sh)
+            if not success:
+                try:
+                    import urllib.request
+                    import urllib.parse
+                    
+                    # Use ntfy.sh as a simple notification service
+                    topic = f"lighteval_{self.email.replace('@', '_').replace('.', '_')}"
+                    url = f"https://ntfy.sh/{topic}"
+                    
+                    # Truncate body if too long for ntfy
+                    notification_body = body
+                    if len(notification_body) > 4000:
+                        notification_body = notification_body[:3900] + "...\n\n[Message truncated]"
+                    
+                    data = notification_body.encode('utf-8')
+                    req = urllib.request.Request(
+                        url,
+                        data=data,
+                        headers={
+                            'Title': subject,
+                            'Priority': 'default',
+                            'Tags': 'computer,evaluation'
+                        }
+                    )
+                    
+                    with urllib.request.urlopen(req, timeout=10) as response:
+                        if response.status == 200:
+                            success = True
+                            logger.info(f"Notification sent successfully via ntfy.sh to topic: {topic}")
+                            logger.info(f"Subscribe to notifications at: https://ntfy.sh/{topic}")
+                        else:
+                            logger.warning(f"ntfy.sh request failed with status {response.status}")
+                            
+                except Exception as e:
+                    logger.debug(f"ntfy.sh method failed: {e}")
+            
+            # Method 3: Try environment-based SMTP
+            if not success:
+                try:
+                    smtp_server = os.environ.get('SMTP_SERVER', 'localhost')
+                    smtp_port = int(os.environ.get('SMTP_PORT', '587'))
+                    smtp_user = os.environ.get('SMTP_USER')
+                    smtp_pass = os.environ.get('SMTP_PASS')
+                    from_email = os.environ.get('FROM_EMAIL', smtp_user or 'lighteval@localhost')
+                    
+                    if smtp_user and smtp_pass:
+                        msg = MIMEMultipart()
+                        msg['From'] = from_email
+                        msg['To'] = self.email
+                        msg['Subject'] = subject
+                        msg.attach(MIMEText(body, 'plain'))
+                        
+                        server = smtplib.SMTP(smtp_server, smtp_port)
+                        server.starttls()
+                        server.login(smtp_user, smtp_pass)
+                        server.send_message(msg)
+                        server.quit()
+                        
+                        success = True
+                        logger.info("Email sent successfully via SMTP")
+                    else:
+                        logger.debug("SMTP credentials not found in environment variables")
+                        
+                except Exception as e:
+                    logger.debug(f"SMTP method failed: {e}")
+            
+            if not success:
+                logger.warning(f"Failed to send email notification to {self.email}. "
+                             "Consider setting up sendmail, ntfy.sh, or SMTP environment variables "
+                             "(SMTP_SERVER, SMTP_PORT, SMTP_USER, SMTP_PASS, FROM_EMAIL)")
+                
+        except Exception as e:
+            logger.error(f"Error sending email notification: {e}")
+
     def save_results(self, date_id: str, results_dict: dict):
         if self.results_path_template is not None:
             org_model_parts = self.general_config_logger.model_name.split("/")
@@ -271,15 +491,15 @@ class EvaluationTracker:
             output_dir = self.output_dir
             output_dir_results = Path(self.results_path_template.format(output_dir=output_dir, org=org, model=model))
         else:
-            output_dir_results = Path(self.output_dir) / "results" / self.general_config_logger.model_name
+            output_dir_results = Path(self.output_dir) / "results" / sanitize_model_name_for_path(self.general_config_logger.model_name)
         self.fs.mkdirs(output_dir_results, exist_ok=True)
-        output_results_file = output_dir_results / f"results_{date_id}.json"
+        output_results_file = output_dir_results / f"{date_id}.json"
         logger.info(f"Saving results to {output_results_file}")
         with self.fs.open(output_results_file, "w") as f:
             f.write(json.dumps(results_dict, cls=EnhancedJSONEncoder, indent=2, ensure_ascii=False))
 
     def _get_details_sub_folder(self, date_id: str):
-        output_dir_details = Path(self.output_dir) / "details" / self.general_config_logger.model_name
+        output_dir_details = Path(self.output_dir) / "details" / sanitize_model_name_for_path(self.general_config_logger.model_name)
         if date_id in ["first", "last"]:
             # Get all folders in output_dir_details
             if not self.fs.exists(output_dir_details):
@@ -301,10 +521,25 @@ class EvaluationTracker:
         date_id = output_dir_details_sub_folder.name  # Overwrite date_id in case of latest
         details_datasets = {}
         for file in self.fs.glob(str(output_dir_details_sub_folder / f"details_*_{date_id}.parquet")):
-            task_name = Path(file).stem.replace("details_", "").replace(f"_{date_id}", "")
-            if "|".join(task_name.split("|")[:-1]) not in task_names:
-                logger.info(f"Skipping {task_name} because it is not in the task_names list")
+            file_task_name = Path(file).stem.replace("details_", "").replace(f"_{date_id}", "")
+            
+            # Try to match against both original and sanitized task names
+            matched_task = None
+            for task_name in task_names:
+                if file_task_name == task_name or file_task_name == sanitize_filename(task_name):
+                    matched_task = task_name
+                    break
+                # Also check if it matches the task name without the last part (for backwards compatibility)
+                task_base = "|".join(task_name.split("|")[:-1])
+                if task_base == file_task_name or task_base == sanitize_filename(file_task_name):
+                    matched_task = task_name
+                    break
+            
+            if matched_task is None:
+                logger.info(f"Skipping {file_task_name} because it doesn't match any task in the task_names list")
                 continue
+            
+            task_name = matched_task
             dataset = load_dataset("parquet", data_files=file, split="train")
             details_datasets[task_name] = dataset
 
@@ -316,13 +551,37 @@ class EvaluationTracker:
         return details_datasets
 
     def save_details(self, date_id: str, details_datasets: dict[str, Dataset]):
-        output_dir_details_sub_folder = self._get_details_sub_folder(date_id)
-        self.fs.mkdirs(output_dir_details_sub_folder, exist_ok=True)
-        logger.info(f"Saving details to {output_dir_details_sub_folder}")
-        for task_name, dataset in details_datasets.items():
-            output_file_details = output_dir_details_sub_folder / f"details_{task_name}_{date_id}.parquet"
+        # Save details to the same results directory, not a separate details directory
+        if self.results_path_template:
+            org_model_parts = self.general_config_logger.model_name.split("/")
+            org = org_model_parts[0] if len(org_model_parts) >= 2 else ""
+            model = org_model_parts[1] if len(org_model_parts) >= 2 else org_model_parts[0]
+            output_dir = self.output_dir
+            output_dir_results = Path(self.results_path_template.format(output_dir=output_dir, org=org, model=model))
+        else:
+            output_dir_results = Path(self.output_dir) / "results" / sanitize_model_name_for_path(self.general_config_logger.model_name)
+        
+        self.fs.mkdirs(output_dir_results, exist_ok=True)
+        logger.info(f"Saving details to {output_dir_results}")
+        
+        # Save details parquet with the same base name as the JSON results
+        output_file_details = output_dir_results / f"{date_id}.parquet"
+        
+        # Combine all task datasets into a single parquet file
+        if details_datasets:
+            # Add task_name column to each dataset and concatenate
+            combined_datasets = []
+            for task_name, dataset in details_datasets.items():
+                # Add task_name as a column
+                dataset_with_task = dataset.add_column("task_name", [task_name] * len(dataset))
+                combined_datasets.append(dataset_with_task)
+            
+            # Concatenate all datasets
+            from datasets import concatenate_datasets
+            combined_dataset = concatenate_datasets(combined_datasets)
+            
             with self.fs.open(str(output_file_details), "wb") as f:
-                dataset.to_parquet(f)
+                combined_dataset.to_parquet(f)
 
     def generate_final_dict(self) -> dict:
         """Aggregates and returns all the logger's experiment information in a dictionary.
@@ -352,7 +611,7 @@ class EvaluationTracker:
         results_dict: dict,
     ) -> None:
         """Pushes the experiment details (all the model predictions for every step) to the hub."""
-        sanitized_model_name = self.general_config_logger.model_name.replace("/", "__")
+        sanitized_model_name = sanitize_model_name_for_path(self.general_config_logger.model_name)
 
         # "Default" detail names are the public detail names (same as results vs private-results)
         repo_id = f"{self.hub_results_org}/details_{sanitized_model_name}"
@@ -382,7 +641,7 @@ class EvaluationTracker:
         results_dataset.to_parquet(f"{fsspec_repo_uri}/{result_file_base_name}.parquet")
 
         for task_name, dataset in details.items():
-            output_file_details = Path(date_id) / f"details_{task_name}_{date_id}.parquet"
+            output_file_details = Path(date_id) / f"details_{sanitize_filename(task_name)}_{date_id}.parquet"
             dataset.to_parquet(f"{fsspec_repo_uri}/{output_file_details}")
 
         self.recreate_metadata_card(repo_id)

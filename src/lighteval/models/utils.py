@@ -30,13 +30,54 @@ import torch
 import yaml
 from huggingface_hub import HfApi
 from pydantic import BaseModel
-from transformers import AutoConfig
+from transformers.models.auto.configuration_auto import AutoConfig
 
 from lighteval.models.model_input import GenerationParameters
 
 
 class ModelConfig(BaseModel, extra="forbid"):
+    """
+    Base configuration class for all model types in Lighteval.
+
+    This is the foundation class that all specific model configurations inherit from.
+    It provides common functionality for parsing configuration from files and command-line arguments,
+    as well as shared attributes that are used by all models like generation parameters and system prompts.
+
+    Attributes:
+        generation_parameters (GenerationParameters):
+            Configuration parameters that control text generation behavior, including
+            temperature, top_p, max_new_tokens, etc. Defaults to empty GenerationParameters.
+        system_prompt (str | None):
+            Optional system prompt to be used with chat models. This prompt sets the
+            behavior and context for the model during evaluation.
+
+    Methods:
+        from_path(path: str):
+            Load configuration from a YAML file.
+        from_args(args: str):
+            Parse configuration from a command-line argument string.
+        _parse_args(args: str):
+            Static method to parse argument strings into configuration dictionaries.
+
+    Example:
+        ```python
+        # Load from YAML file
+        config = ModelConfig.from_path("model_config.yaml")
+
+        # Load from command line arguments
+        config = ModelConfig.from_args("model_name=meta-llama/Llama-3.1-8B-Instruct,system_prompt='You are a helpful assistant.',generation_parameters={temperature=0.7}")
+
+        # Direct instantiation
+        config = ModelConfig(
+            model_name="meta-llama/Llama-3.1-8B-Instruct",
+            generation_parameters=GenerationParameters(temperature=0.7),
+            system_prompt="You are a helpful assistant."
+        )
+        ```
+    """
+
     generation_parameters: GenerationParameters = GenerationParameters()
+    system_prompt: str | None = None
 
     @classmethod
     def from_path(cls, path: str):
@@ -55,47 +96,95 @@ class ModelConfig(BaseModel, extra="forbid"):
         """Parse a string of arguments into a configuration dictionary.
 
         This function parses a string containing model arguments and generation parameters
-        into a structured dictionary with two main sections: 'model' and 'generation'.
-        It specifically handles generation parameters enclosed in curly braces.
+        into a structured dictionary. It properly handles quoted strings that may contain commas.
 
         Args:
             args (str): A string containing comma-separated key-value pairs, where generation
                 parameters can be specified in a nested JSON-like format.
 
         Returns:
-            dict: A dictionary with two keys:
-                - 'model': Contains general model configuration parameters
-                - 'generation': Contains generation-specific parameters
+            dict: A dictionary containing the parsed configuration parameters
 
         Examples:
             >>> parse_args("model_name=gpt2,max_length=100")
-            {
-                'model': {'model_name': 'gpt2', 'max_length': '100'},
-            }
+            {'model_name': 'gpt2', 'max_length': '100'}
+
+            >>> parse_args("model_name=gpt2,system_prompt='Hello, world!'")
+            {'model_name': 'gpt2', 'system_prompt': 'Hello, world!'}
 
             >>> parse_args("model_name=gpt2,generation_parameters={temperature:0.7,top_p:0.9}")
-            {
-                'model': {'model_name': 'gpt2', 'generation_parameters': {'temperature': 0.7, 'top_p': 0.9},
-            }
-
-            >>> parse_args("model_name=gpt2,use_cache,generation_parameters={temperature:0.7}")
-            {
-                'model': {'model_name': 'gpt2', 'use_cache': True, 'generation_parameters': {'temperature': 0.7}},
-            }
+            {'model_name': 'gpt2', 'generation_parameters': {'temperature': 0.7, 'top_p': 0.9}}
         """
-        # Looking for generation_parameters in the model_args
+        def split_args_respecting_quotes(text):
+            """Split on commas but respect quoted strings and nested braces"""
+            parts = []
+            current = ""
+            in_quotes = False
+            quote_char = None
+            brace_depth = 0
+            i = 0
+            
+            while i < len(text):
+                char = text[i]
+                
+                if char in ('"', "'") and not in_quotes:
+                    in_quotes = True
+                    quote_char = char
+                    current += char
+                elif char == quote_char and in_quotes:
+                    in_quotes = False
+                    quote_char = None
+                    current += char
+                elif char == '{' and not in_quotes:
+                    brace_depth += 1
+                    current += char
+                elif char == '}' and not in_quotes:
+                    brace_depth -= 1
+                    current += char
+                elif char == ',' and not in_quotes and brace_depth == 0:
+                    parts.append(current.strip())
+                    current = ""
+                else:
+                    current += char
+                i += 1
+            
+            if current.strip():
+                parts.append(current.strip())
+            
+            return parts
+
+        # Split arguments respecting quotes and braces
+        arg_parts = split_args_respecting_quotes(args)
+        
+        model_config = {}
         generation_parameters_dict = None
-        pattern = re.compile(r"(\w+)=(\{.*\}|[^,]+)")
-        matches = pattern.findall(args)
-        for key, value in matches:
-            key = key.strip()
-            if key == "generation_parameters":
-                gen_params = re.sub(r"(\w+):", r'"\1":', value)
-                generation_parameters_dict = json.loads(gen_params)
-
-        args = re.sub(r"generation_parameters=\{.*?\},?", "", args).strip(",")
-        model_config = {k.split("=")[0]: k.split("=")[1] if "=" in k else True for k in args.split(",")}
-
+        
+        for part in arg_parts:
+            part = part.strip()
+            if not part:
+                continue
+                
+            if "=" in part:
+                key, value = part.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                
+                # Handle quoted strings
+                if value.startswith(("'", '"')) and value.endswith(("'", '"')) and len(value) >= 2:
+                    value = value[1:-1]  # Remove quotes
+                
+                # Handle generation_parameters specially
+                if key == "generation_parameters":
+                    if value.startswith("{") and value.endswith("}"):
+                        gen_params = re.sub(r"(\w+):", r'"\1":', value)
+                        generation_parameters_dict = json.loads(gen_params)
+                    continue
+                
+                model_config[key] = value
+            else:
+                # Boolean flag (no =)
+                model_config[part] = True
+        
         if generation_parameters_dict is not None:
             model_config["generation_parameters"] = generation_parameters_dict
 
