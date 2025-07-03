@@ -27,13 +27,13 @@ from lighteval.metrics.dynamic_metrics import (
     IndicesExtractionConfig,
     multilingual_extractive_match_metric,
 )
-from lighteval.metrics.metrics import MetricCategory, MetricUseCase, SampleLevelMetric
+from lighteval.metrics.utils.metric_utils import SampleLevelMetric
 from lighteval.metrics.metrics_sample import (
     PassAtK,
 )
 from lighteval.tasks.default_prompts import LETTER_INDICES
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
-from lighteval.tasks.requests import Doc
+from lighteval.tasks.requests import Doc, SamplingMethod
 from lighteval.utils.language import Language
 
 
@@ -84,9 +84,10 @@ def create_mmlu_task(lang: str, language: Language, is_lite: bool = False) -> Li
         hf_subset=lang,
         evaluation_splits=("test",),
         few_shots_split="dev",
-        metric=[
+        metrics=[
             SampleLevelMetric(
                 metric_name="pass@1:1_samples",
+                category=SamplingMethod.GENERATIVE,
                 sample_level_fn=PassAtK(
                     k=1,
                     n=1,
@@ -101,8 +102,6 @@ def create_mmlu_task(lang: str, language: Language, is_lite: bool = False) -> Li
                         precision=6,
                     ).sample_level_fn([ref], [pred], doc),
                 ).compute,
-                category=MetricCategory.GENERATIVE_SAMPLING,
-                use_case=MetricUseCase.REASONING,
                 corpus_level_fn=np.mean,
                 higher_is_better=True,
             )
