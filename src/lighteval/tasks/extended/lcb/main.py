@@ -47,7 +47,9 @@ from lighteval.tasks.extended.lcb.streaming_evaluator import (
     enhanced_codegen_metrics,
     streaming_codegen_metrics,
 )
-from lighteval.tasks.lighteval_task import Doc, LightevalTaskConfig
+from lighteval.tasks.lighteval_task import Doc, LightevalTaskConfig, LightevalTask
+from datasets import load_dataset, Dataset
+import pandas as pd
 from lighteval.tasks.requests import SamplingMethod
 
 
@@ -109,7 +111,6 @@ def prepare_prompt(line: dict[str, Any]) -> str:
     return prompt
 
 
-# Note: Date filtering is handled by the native LCB --start_date argument, not here
 
 
 def lcb_codegeneration_prompt_fn(line, task_name: str = "lcb:codegeneration") -> Doc:
@@ -147,11 +148,17 @@ def lcb_codegeneration_prompt_fn(line, task_name: str = "lcb:codegeneration") ->
     )
 
 
+# Note: Date filtering is now handled by pre-filtering the dataset with pandas
+# The lcb_codegeneration_aug2024_prompt_fn is no longer needed
+
+
 def codegen_metric(doc: Doc, model_response, **kwargs) -> float:
     """Estimates the Pass@1 metric for the code generation task.
     Extract the code from each prediction, Runs it for each sample and generations,
     and computes the Pass@1 over the outputs.
     """
+    # Note: Filtering is now handled by pre-filtering the dataset, so no need to check here
+    
     # Extract generated code snippets from model response
     predictions = model_response.text if hasattr(model_response, 'text') else [str(model_response)]
     
@@ -221,7 +228,7 @@ configs = [
     "release_v1",    # May 2023 - Mar 2024 (400 problems)
     "release_v2",    # May 2023 - May 2024 (511 problems)
     "release_v3",    # May 2023 - Jul 2024 (612 problems)
-    "release_v4",    # May 2023 - Sep 2024 (713 problems) - includes Aug 2024+
+    "release_v4",    # May 2023 - Sep 2024 (713 problems)
     "release_v5",    # May 2023 - Jan 2025 (880 problems)
     "release_v6",    # May 2023 - Apr 2025 (1055 problems)
     "release_latest",
@@ -268,21 +275,47 @@ for subset in configs:
 # Create tasks that use standard datasets (date filtering handled by native LCB --start_date)
 # Note: For August 2024+ filtering, use release_v4 or later and pass --start_date to native LCB runner
 
-# August 2024+ approximation using release_v4 (May 2023 - Sep 2024)  
+def create_date_filter(start_date_str: str = "2024-08-01"):
+    """Create an hf_filter function for date-based filtering."""
+    import pandas as pd
+    from rich.console import Console
+    
+    console = Console()
+    start_date = pd.to_datetime(start_date_str)
+    
+    def date_filter(example):
+        """Filter function to keep only examples after start_date."""
+        try:
+            contest_date = pd.to_datetime(example['contest_date'])
+            return contest_date >= start_date
+        except:
+            # If date parsing fails, include the example
+            return True
+    
+    # Print filtering info when filter is created
+    console.print(f"[blue]📅 Created date filter for problems >= {start_date_str}[/blue]")
+    
+    return date_filter
+
+# Create a task that uses hf_filter for date filtering
+start_date_str = os.getenv("LCB_START_DATE", "2024-08-01")
 august_2024_task = LightevalTaskConfig(
     name="lcb:codegeneration_aug2024_plus",
     suite=["extended"],
     prompt_function=lcb_codegeneration_prompt_fn,
     hf_repo="livecodebench/code_generation_lite",
-    hf_subset="release_v4",  # Contains problems through Sep 2024
+    hf_subset="release_v6",
     hf_avail_splits=["test"],
     evaluation_splits=["test"],
     generation_size=32768,
     metrics=[Metrics.lcb_codegen_metric],
     stop_sequence=[],
     trust_dataset=True,
+    hf_filter=create_date_filter(start_date_str),  # Apply date filtering
     version=0,
 )
+
+# Add the filtered task to the tasks list
 tasks.append(august_2024_task)
 
 
@@ -293,12 +326,14 @@ TASKS_TABLE = tasks
 # LCB_PREPEND_SYSTEM_PROMPT: Add custom text to prepend to system prompt
 # LCB_USE_STREAMING: Enable streaming evaluation (default: true)
 # LCB_MAX_WORKERS: Batch size for pipeline processing (execution is always single-core)
+# LCB_START_DATE: Start date for filtering problems (format: YYYY-MM-DD, default: 2024-08-01)
 # 
 # Example usage with evaluate.sh (alitellm compatible):
 # 
-# For optimized performance with overlapped inference/scoring:
-# export LCB_USE_STREAMING=true
-# export LCB_MAX_WORKERS=16  # Batch size for pipeline processing
+# For configurable date filtering:
+# export LCB_USE_STREAMING=false  # Single-core for reliability
+# export LCB_MAX_WORKERS=1
+# export LCB_START_DATE=2024-08-01  # Filter for August 2024+ problems
 # 
 # ./evaluate.sh --base_url https://openrouter.ai/api/v1 \
 #               --api_key $OPENROUTER_API_KEY \
@@ -307,8 +342,9 @@ TASKS_TABLE = tasks
 #               --parallel_calls 8 \
 #               --out_dir ./results
 #
-# Note: The "aug2024_plus" task uses release_v4 dataset (May 2023 - Sep 2024).
-# For true August 2024+ filtering, use the native LCB runner with --start_date 2024-08-01
+# Note: The "aug2024_plus" task now implements proper date filtering using LCB_START_DATE.
+# It loads release_v6 dataset (1055 problems) but only evaluates problems >= LCB_START_DATE.
+# Change LCB_START_DATE to any date in YYYY-MM-DD format to adjust the filtering.
 #
 # The LCB tasks now support:
 # - Overlapped inference and scoring via streaming evaluation
