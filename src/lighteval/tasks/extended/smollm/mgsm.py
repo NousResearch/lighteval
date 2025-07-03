@@ -113,7 +113,7 @@ MGSM_TASKS = [
         hf_subset=lang,
         evaluation_splits=("test",),
         few_shots_split="train",
-        metric=[
+        metrics=[
             Metrics.math_pass_at_1_1n,
             Metrics.math_pass_at_1_4n,
         ],
