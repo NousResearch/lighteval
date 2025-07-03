@@ -23,6 +23,8 @@
 import asyncio
 import logging
 import json
+import time
+from collections import deque
 from typing import Optional
 
 from rich import print as rprint
@@ -116,6 +118,9 @@ class AsyncLiteLLMModelConfig(ModelConfig):
     api_key: str | None = None
     split_n_size: int = 8
     parallel_calls_count: int = 32
+    num_workers: int = 1  # Number of workers for concurrency ramping
+    master_setup_time: float | None = None  # Master setup time in seconds for ramping calculation; if None, will be measured
+    max_rpm: int = 256  # Maximum requests per minute for rate limiting
 
 
 class AsyncLiteLLMClient(LightevalModel):
@@ -141,13 +146,58 @@ class AsyncLiteLLMClient(LightevalModel):
         self.generation_parameters = config.generation_parameters
         self.split_n_size = config.split_n_size
         self.parallel_calls_count = config.parallel_calls_count
+        self.num_workers = config.num_workers
+        self.master_setup_time = config.master_setup_time
+        self.max_rpm = config.max_rpm
 
         self.API_MAX_RETRY = 5
         self.API_RETRY_SLEEP = 60  # Start with 60 seconds (1 minute) for server overload issues
         self.API_RETRY_MULTIPLIER = 2
         
-        # Create semaphore for concurrency control
-        self.semaphore = asyncio.Semaphore(self.parallel_calls_count)
+        # Initialize concurrency ramping
+        self.start_time = time.time()
+        self.initial_concurrency = max(1, self.parallel_calls_count // self.num_workers)
+        self.master_setup_time = config.master_setup_time
+        self.measured_setup_time = None
+        self.setup_measurement_start = self.start_time
+        self.ramp_up_time = None  # Will be set once we have master_setup_time
+        
+        # Create semaphore for concurrency control - start with initial concurrency
+        self.semaphore = asyncio.Semaphore(self.initial_concurrency)
+        self._current_concurrency = self.initial_concurrency
+        self._ramping_task = None
+        
+        # Rate limiting setup
+        self.request_timestamps = deque()  # Track request timestamps for rate limiting
+        self.rate_limit_lock = asyncio.Lock()  # Lock for thread-safe rate limiting
+        
+        # Log ramping configuration
+        if self.master_setup_time is not None:
+            self.ramp_up_time = self.master_setup_time * 2.2
+            console.print(Panel.fit(
+                f"[bold cyan]Async LiteLLM Concurrency Ramping Configuration:[/bold cyan]\n"
+                f"[green]Number of workers:[/green] {self.num_workers}\n"
+                f"[green]Master setup time:[/green] {self.master_setup_time:.1f}s (user-provided)\n"
+                f"[green]Ramp-up time:[/green] {self.ramp_up_time:.1f}s\n"
+                f"[green]Initial concurrency:[/green] {self.initial_concurrency}\n"
+                f"[green]Full concurrency:[/green] {self.parallel_calls_count}\n"
+                f"[green]Max RPM:[/green] {self.max_rpm}\n"
+                f"[green]Concurrency scaling:[/green] {self.initial_concurrency} → {self.parallel_calls_count}",
+                title="Concurrency Ramping Setup",
+                border_style="blue"
+            ))
+        else:
+            console.print(Panel.fit(
+                f"[bold cyan]Async LiteLLM Concurrency Ramping Configuration:[/bold cyan]\n"
+                f"[green]Number of workers:[/green] {self.num_workers}\n"
+                f"[green]Master setup time:[/green] [yellow]Will be measured automatically[/yellow]\n"
+                f"[green]Initial concurrency:[/green] {self.initial_concurrency}\n"
+                f"[green]Full concurrency:[/green] {self.parallel_calls_count}\n"
+                f"[green]Max RPM:[/green] {self.max_rpm}\n"
+                f"[green]Concurrency scaling:[/green] {self.initial_concurrency} → {self.parallel_calls_count}",
+                title="Concurrency Ramping Setup",
+                border_style="blue"
+            ))
 
         self._tokenizer = encode
         self.pairwise_tokenization = False
@@ -156,6 +206,104 @@ class AsyncLiteLLMClient(LightevalModel):
         self.prompt_manager = PromptManager(
             use_chat_template=True, tokenizer=self.tokenizer, system_prompt=config.system_prompt
         )
+
+    def _measure_setup_time_if_needed(self):
+        """Measure master setup time if it hasn't been set yet."""
+        if self.master_setup_time is None and self.measured_setup_time is None:
+            # This is the first time we're called, measure the setup time
+            current_time = time.time()
+            self.measured_setup_time = current_time - self.setup_measurement_start
+            self.master_setup_time = self.measured_setup_time
+            self.ramp_up_time = self.master_setup_time * 2.2
+            
+            # Log the measured setup time
+            console.print(Panel.fit(
+                f"[bold cyan]Master Setup Time Measured:[/bold cyan]\n"
+                f"[green]Measured setup time:[/green] {self.measured_setup_time:.1f}s\n"
+                f"[green]Calculated ramp-up time:[/green] {self.ramp_up_time:.1f}s (2.2x setup time)\n"
+                f"[green]Concurrency will scale from:[/green] {self.initial_concurrency} → {self.parallel_calls_count}",
+                title="Setup Time Measurement",
+                border_style="yellow"
+            ))
+
+    def _get_current_concurrency(self) -> int:
+        """Get the current concurrency limit based on elapsed time and ramping schedule."""
+        # Measure setup time if needed
+        self._measure_setup_time_if_needed()
+        
+        # If we still don't have a ramp_up_time, stay at initial concurrency
+        if self.ramp_up_time is None:
+            return self.initial_concurrency
+            
+        elapsed_time = time.time() - self.start_time
+        
+        if elapsed_time < self.ramp_up_time:
+            # Still in initial phase, use initial concurrency
+            return self.initial_concurrency
+        else:
+            # Ramp-up time has passed, use full concurrency
+            return self.parallel_calls_count
+
+    async def _update_semaphore_if_needed(self):
+        """Update semaphore capacity if the current concurrency has changed."""
+        target_concurrency = self._get_current_concurrency()
+        
+        if target_concurrency != self._current_concurrency:
+            # Log the concurrency change
+            ramp_up_status = f"{self.ramp_up_time:.1f}s" if self.ramp_up_time is not None else "Not yet determined"
+            console.print(Panel.fit(
+                f"[bold cyan]Concurrency Ramping:[/bold cyan]\n"
+                f"[green]Elapsed time:[/green] {time.time() - self.start_time:.1f}s\n"
+                f"[green]Ramping from:[/green] {self._current_concurrency} → {target_concurrency}\n"
+                f"[green]Ramp-up time:[/green] {ramp_up_status}\n"
+                f"[green]Initial concurrency:[/green] {self.initial_concurrency}\n"
+                f"[green]Full concurrency:[/green] {self.parallel_calls_count}",
+                title="Concurrency Scaling",
+                border_style="magenta"
+            ))
+            
+            # Create new semaphore with updated capacity
+            old_semaphore = self.semaphore
+            self.semaphore = asyncio.Semaphore(target_concurrency)
+            self._current_concurrency = target_concurrency
+            
+            # Note: We don't need to migrate waiters since this typically happens
+            # at the start of new batches, not during active API calls
+
+    async def _wait_for_rate_limit(self):
+        """Wait for rate limiting based on max_rpm to ensure requests are spread out."""
+        async with self.rate_limit_lock:
+            current_time = time.time()
+            
+            # Remove timestamps older than 60 seconds
+            while self.request_timestamps and current_time - self.request_timestamps[0] > 60:
+                self.request_timestamps.popleft()
+            
+            # If we've hit the rate limit, wait
+            if len(self.request_timestamps) >= self.max_rpm:
+                # Wait until the oldest request is more than 60 seconds old
+                wait_time = 60 - (current_time - self.request_timestamps[0])
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
+                    # Clean up old timestamps again after waiting
+                    current_time = time.time()
+                    while self.request_timestamps and current_time - self.request_timestamps[0] > 60:
+                        self.request_timestamps.popleft()
+            
+            # Add current request timestamp
+            self.request_timestamps.append(current_time)
+            
+            # Calculate inter-request delay to spread out requests evenly
+            inter_request_delay = 60.0 / self.max_rpm
+            
+            # If we have recent requests, ensure minimum spacing
+            if len(self.request_timestamps) > 1:
+                time_since_last = current_time - self.request_timestamps[-2]
+                if time_since_last < inter_request_delay:
+                    additional_wait = inter_request_delay - time_since_last
+                    await asyncio.sleep(additional_wait)
+                    # Update the timestamp to reflect the actual send time
+                    self.request_timestamps[-1] = time.time()
 
     def _prepare_stop_sequence(self, stop_sequence):
         """Prepare and validate stop sequence."""
@@ -233,6 +381,9 @@ class AsyncLiteLLMClient(LightevalModel):
 
     async def __call_api_single(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata=None):
         """Make single async API call with retries."""
+        # Apply rate limiting before making the request
+        await self._wait_for_rate_limit()
+        
         for attempt in range(self.API_MAX_RETRY):
             try:
                 stop_sequence = self._prepare_stop_sequence(stop_sequence)
@@ -292,6 +443,8 @@ class AsyncLiteLLMClient(LightevalModel):
                     "token_param_used": "max_completion_tokens" if any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]) else "max_tokens",
                     "num_samples": num_samples,
                     "message_count": len(prompt) if isinstance(prompt, list) else 0,
+                    "max_rpm": self.max_rpm,
+                    "inter_request_delay": f"{60.0 / self.max_rpm:.2f}s",
                     "generation_parameters": {k: v for k, v in kwargs.items() 
                                             if k not in ["model", "messages", "api_key", "base_url", "n", "caching"]}
                 }
@@ -326,6 +479,8 @@ class AsyncLiteLLMClient(LightevalModel):
                         f"[green]max_tokens:[/green] {request_info['max_tokens']}",
                         f"[green]num_samples:[/green] {request_info['num_samples']}",
                         f"[green]message_count:[/green] {request_info['message_count']}",
+                        f"[green]Max RPM:[/green] {request_info['max_rpm']}",
+                        f"[green]Inter-request delay:[/green] {request_info['inter_request_delay']}",
                         "[green]Generation Parameters:[/green]"
                     ]),
                     title=request_title,
@@ -460,7 +615,10 @@ class AsyncLiteLLMClient(LightevalModel):
         metadata_list = metadata if metadata is not None else [None] * len(prompts)
         assert len(prompts) == len(metadata_list), f"Length of prompts ({len(prompts)}) and metadata ({len(metadata_list)}) must be the same"
 
-        # Create bounded async API call function
+        # Update semaphore capacity if needed before starting API calls
+        await self._update_semaphore_if_needed()
+
+        # Create bounded async API call function with rate limiting
         async def bounded_api_call(prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata):
             async with self.semaphore:
                 return await self.__call_api(prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata)
