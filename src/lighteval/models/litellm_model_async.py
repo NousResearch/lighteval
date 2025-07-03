@@ -175,6 +175,16 @@ class AsyncLiteLLMClient(LightevalModel):
             max_new_tokens = min(max_new_tokens * 10, 32000)
         return max_new_tokens
 
+    def _format_response_with_reasoning(self, message):
+        """Format response content with reasoning in <think> tags."""
+        content = message.content or ""
+        reasoning = getattr(message, 'reasoning_content', None)
+        
+        if reasoning:
+            return f"<think>\n{reasoning}\n</think>\n\n{content}"
+        else:
+            return content
+
     async def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata=None):
         """Make async API call with splitting logic."""
         # If requested, split num_samples into chunks of size split_n_size
@@ -518,7 +528,7 @@ class AsyncLiteLLMClient(LightevalModel):
             responses = await self.__call_api_parallel(contexts, return_logits, max_new_tokens, num_samples, stop_sequence, metadata_list)
 
             for response, context in zip(responses, contexts):
-                result: list[str] = [choice.message.content for choice in response.choices]
+                result: list[str] = [self._format_response_with_reasoning(choice.message) for choice in response.choices]
 
                 # Extract token usage from LiteLLM response for logging
                 input_token_count = response.usage.prompt_tokens if response.usage else 0
