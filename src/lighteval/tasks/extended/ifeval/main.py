@@ -157,7 +157,7 @@ ifeval = LightevalTaskConfig(
     evaluation_splits=["train"],
     few_shots_split="train",
     few_shots_select="random_sampling",
-    generation_size=1280,
+    generation_size=None,
     stop_sequence=[],  # no stop sequence, will use eot token
     version="0.1",
 )
