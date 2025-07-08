@@ -7902,7 +7902,7 @@ gpqa_diamond_instruct_lighteval = LightevalTaskConfig(
     evaluation_splits=["train"],
     few_shots_split=None,
     few_shots_select=None,
-    generation_size=32768,  # needed for reasoning models like R1
+    generation_size=None,  # needed for reasoning models like R1
     metrics=[
         Metrics.gpqa_instruct_pass_at_1_1n,
         Metrics.gpqa_instruct_pass_at_1_4n,
