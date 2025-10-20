@@ -145,6 +145,10 @@ class AsyncLiteLLMClient(LightevalModel):
         self.base_url = config.base_url
         self.api_key = config.api_key
         self.generation_parameters = config.generation_parameters
+        # Debug log the generation parameters at initialization
+        if hasattr(self.generation_parameters, 'extra_body') and self.generation_parameters.extra_body:
+            logger.info(f"[DEBUG] extra_body at init: {self.generation_parameters.extra_body}")
+            print(f"[DEBUG] extra_body at initialization: {self.generation_parameters.extra_body}")
         self.split_n_size = config.split_n_size
         self.parallel_calls_count = config.parallel_calls_count
         self.initial_concurrency = config.initial_concurrency
@@ -357,8 +361,7 @@ class AsyncLiteLLMClient(LightevalModel):
 
     async def __call_api_single(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata=None):
         """Make single async API call with retries."""
-        # Apply rate limiting before making the request
-        await self._wait_for_rate_limit()
+        # Note: Rate limiting is now handled in bounded_api_call before semaphore acquisition
         
         # Use tenacity to handle retries with exponential backoff and jitter
         try:
@@ -431,7 +434,7 @@ class AsyncLiteLLMClient(LightevalModel):
             "caching": False,
             "cache": {"no-cache": True},
             "api_key": self.api_key,
-            "request_timeout": 3600,  # 15 minutes timeout
+            # request_timeout will be set from generation_parameters below
         }
         if num_samples > 1 and self.generation_parameters.temperature == 0:
             raise ValueError(
@@ -443,6 +446,11 @@ class AsyncLiteLLMClient(LightevalModel):
         else:
             # Update with generation parameters
             litellm_params = self.generation_parameters.to_litellm_dict()
+            
+            # Debug log the extra_body from generation parameters
+            if "extra_body" in litellm_params:
+                logger.info(f"[DEBUG] extra_body from generation_parameters: {litellm_params['extra_body']}")
+                print(f"[DEBUG] extra_body from generation_parameters: {litellm_params['extra_body']}")
             
             # If max_new_tokens is specified in generation parameters, handle it differently
             # Rename max_new_tokens to max_tokens for non-o-series models
@@ -459,6 +467,11 @@ class AsyncLiteLLMClient(LightevalModel):
             else:
                 kwargs["max_tokens"] = max_new_tokens
         
+        # Log extra_body explicitly for debugging
+        if "extra_body" in kwargs:
+            logger.info(f"[DEBUG] extra_body being passed to API: {kwargs['extra_body']}")
+            print(f"[DEBUG] extra_body content: {kwargs['extra_body']}")
+        
         # Rich logging of the request details
         request_info = {
             "model": self.model,
@@ -473,6 +486,7 @@ class AsyncLiteLLMClient(LightevalModel):
             "message_count": len(prompt) if isinstance(prompt, list) else 0,
             "max_rpm": self.max_rpm,
             "inter_request_delay": f"{60.0 / self.max_rpm:.2f}s",
+            "extra_body": kwargs.get("extra_body"),  # Add extra_body to request_info
             "generation_parameters": {k: v for k, v in kwargs.items() 
                                     if k not in ["model", "messages", "api_key", "base_url", "n", "caching"]}
         }
@@ -509,6 +523,7 @@ class AsyncLiteLLMClient(LightevalModel):
                 f"[green]message_count:[/green] {request_info['message_count']}",
                 f"[green]Max RPM:[/green] {request_info['max_rpm']}",
                 f"[green]Inter-request delay:[/green] {request_info['inter_request_delay']}",
+                f"[green]Extra Body:[/green] {request_info['extra_body']}",
                 "[green]Generation Parameters:[/green]"
             ]),
             title=request_title,
@@ -594,6 +609,11 @@ class AsyncLiteLLMClient(LightevalModel):
 
         # Create bounded async API call function with rate limiting
         async def bounded_api_call(prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata):
+            # BUG FIX: Apply rate limiting BEFORE acquiring semaphore
+            # This prevents requests from timing out while waiting in the rate limiter queue
+            # after they've already acquired the semaphore. The timeout should only start
+            # counting once the request is actually ready to be sent.
+            await self._wait_for_rate_limit()
             async with self.semaphore:
                 return await self.__call_api(prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata)
 

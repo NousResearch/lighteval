@@ -474,7 +474,7 @@ def alitellm(
     ] = 32,
     parallel_calls_count: Annotated[
         int, Option(help="Number of concurrent async API calls", rich_help_panel=HELP_PANEL_NAME_3)
-    ] = 50,
+    ] = 512,
     email: Annotated[
         Optional[str], Option(help="Email address to send notification when evaluation completes.", rich_help_panel=HELP_PANEL_NAME_2)
     ] = None,
