@@ -407,14 +407,14 @@ aime25 = LightevalTaskConfig(
     evaluation_splits=["train"],
     few_shots_split=None,
     few_shots_select=None,
-    generation_size=10000,
+    generation_size=None,
     metrics=[
         Metrics.math_pass_at_1_1n,
-        # Metrics.math_pass_at_1_4n,
-        # Metrics.math_pass_at_1_8n,
-        # Metrics.math_pass_at_1_16n,
-        # Metrics.math_pass_at_1_32n,
-        # Metrics.math_pass_at_1_64n,
+        Metrics.math_pass_at_1_4n,
+        Metrics.math_pass_at_1_8n,
+        Metrics.math_pass_at_1_16n,
+        Metrics.math_pass_at_1_32n,
+        Metrics.math_pass_at_1_64n,
     ],
     version=2,
 )
@@ -7902,11 +7902,11 @@ gpqa_diamond_instruct_lighteval = LightevalTaskConfig(
     evaluation_splits=["train"],
     few_shots_split=None,
     few_shots_select=None,
-    generation_size=32768,  # needed for reasoning models like R1
+    generation_size=None,  # needed for reasoning models like R1
     metrics=[
         Metrics.gpqa_instruct_pass_at_1_1n,
-        # Metrics.gpqa_instruct_pass_at_1_4n,
-        # Metrics.gpqa_instruct_pass_at_1_8n,
+        Metrics.gpqa_instruct_pass_at_1_4n,
+        Metrics.gpqa_instruct_pass_at_1_8n,
     ],
     stop_sequence=[],  # no stop sequence, will use eos token
     trust_dataset=True,

@@ -31,6 +31,7 @@ from rich import print as rprint
 from rich.pretty import pprint
 from rich.panel import Panel
 from rich.console import Console
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from lighteval.data import GenerativeTaskDataset
 from lighteval.models.abstract_model import LightevalModel
@@ -144,15 +145,20 @@ class AsyncLiteLLMClient(LightevalModel):
         self.base_url = config.base_url
         self.api_key = config.api_key
         self.generation_parameters = config.generation_parameters
+        # Debug log the generation parameters at initialization
+        if hasattr(self.generation_parameters, 'extra_body') and self.generation_parameters.extra_body:
+            logger.info(f"[DEBUG] extra_body at init: {self.generation_parameters.extra_body}")
+            print(f"[DEBUG] extra_body at initialization: {self.generation_parameters.extra_body}")
         self.split_n_size = config.split_n_size
         self.parallel_calls_count = config.parallel_calls_count
         self.initial_concurrency = config.initial_concurrency
         self.ramp_up_secs = config.ramp_up_secs
         self.max_rpm = config.max_rpm
 
-        self.API_MAX_RETRY = 5
-        self.API_RETRY_SLEEP = 60  # Start with 60 seconds (1 minute) for server overload issues
-        self.API_RETRY_MULTIPLIER = 2
+        # Retry configuration for tenacity
+        self.max_retries = 5
+        self.retry_min_wait = 60  # Start with 60 seconds (1 minute) for server overload issues
+        self.retry_max_wait = 600  # Max wait time of 10 minutes
         
         # Initialize concurrency ramping
         self.start_time = time.time()
@@ -355,216 +361,225 @@ class AsyncLiteLLMClient(LightevalModel):
 
     async def __call_api_single(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata=None):
         """Make single async API call with retries."""
-        # Apply rate limiting before making the request
-        await self._wait_for_rate_limit()
+        # Note: Rate limiting is now handled in bounded_api_call before semaphore acquisition
         
-        for attempt in range(self.API_MAX_RETRY):
+        # Use tenacity to handle retries with exponential backoff and jitter
+        try:
+            return await self._make_api_call_with_retries(prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata)
+        except Exception as e:
+            # If all retries are exhausted, log the failure and return empty response
+            logger.error(f"Async API call failed after 5 attempts: {e}")
+            
+            # Prepare a base meta string for titles if metadata provided
+            if metadata:
+                try:
+                    idx = int(metadata.get("index", 1))
+                    total = int(metadata.get("total", 0))
+                except Exception:
+                    idx = metadata.get("index", 1)
+                    total = metadata.get("total", 0)
+                base_meta = f"{metadata.get('benchmark', '')} {idx}/{total}"
+                failure_title = f"Async LiteLLM API Failure — {base_meta} — 5 attempts exhausted"
+            else:
+                failure_title = "Async LiteLLM API Failure"
+            
+            console.print(Panel.fit(
+                f"[bold red]Async API call failed after 5 attempts[/bold red]\nReturning empty response.\nFinal error: {str(e)}",
+                title=failure_title,
+                border_style="red"
+            ))
+            
+            # Create a mock LitellmModelResponse with empty content
+            from types import SimpleNamespace
+            
+            # Create a mock response that matches LiteLLM's structure
+            empty_choice = SimpleNamespace()
+            empty_choice.message = SimpleNamespace()
+            empty_choice.message.content = ""
+            
+            empty_usage = SimpleNamespace()
+            empty_usage.prompt_tokens = 0
+            empty_usage.completion_tokens = 0
+            
+            mock_response = SimpleNamespace()
+            mock_response.choices = [empty_choice]
+            mock_response.usage = empty_usage
+            
+            return mock_response
+
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=60, max=600, exp_base=2),
+        retry=retry_if_exception_type((Exception,)),
+        reraise=True
+    )
+    async def _make_api_call_with_retries(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata=None):
+        """Make the actual API call with tenacity retry decorator."""
+        attempt = self._make_api_call_with_retries.retry.statistics.get('attempt_number', 1)
+        
+        stop_sequence = self._prepare_stop_sequence(stop_sequence)
+        original_max_new_tokens = max_new_tokens
+        max_new_tokens = self._prepare_max_new_tokens(max_new_tokens)
+
+        if return_logits and not self.provider == "openai":
+            logger.warning("Returning logits is not supported for this provider, ignoring.")
+
+        # Prepare kwargs for completion call
+        kwargs = {
+            "model": self.model,
+            "messages": prompt,
+            "logprobs": return_logits if self.provider == "openai" else None,
+            "base_url": self.base_url,
+            "n": num_samples,
+            "caching": False,
+            "cache": {"no-cache": True},
+            "api_key": self.api_key,
+            # request_timeout will be set from generation_parameters below
+        }
+        if num_samples > 1 and self.generation_parameters.temperature == 0:
+            raise ValueError(
+                "num_samples > 1 but temperature is set to 0, this will not sample different outputs."
+            )
+
+        if any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]):
+            logger.warning("OpenAI o-series models do not support temperature, top_p, stop sequence. Disabling.")
+        else:
+            # Update with generation parameters
+            litellm_params = self.generation_parameters.to_litellm_dict()
+            
+            # Debug log the extra_body from generation parameters
+            if "extra_body" in litellm_params:
+                logger.info(f"[DEBUG] extra_body from generation_parameters: {litellm_params['extra_body']}")
+                print(f"[DEBUG] extra_body from generation_parameters: {litellm_params['extra_body']}")
+            
+            # If max_new_tokens is specified in generation parameters, handle it differently
+            # Rename max_new_tokens to max_tokens for non-o-series models
+            if "max_completion_tokens" in litellm_params and not any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]):
+                litellm_params["max_tokens"] = litellm_params.pop("max_completion_tokens")
+            
+            kwargs.update(litellm_params)
+
+        # Use max_tokens instead of max_completion_tokens for all models except those starting with "o1", "o3", or "o4"
+        # Only set these if they aren't already set from generation_parameters
+        if not kwargs.get("max_completion_tokens") and not kwargs.get("max_tokens"):
+            if any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]):
+                kwargs["max_completion_tokens"] = max_new_tokens
+            else:
+                kwargs["max_tokens"] = max_new_tokens
+        
+        # Log extra_body explicitly for debugging
+        if "extra_body" in kwargs:
+            logger.info(f"[DEBUG] extra_body being passed to API: {kwargs['extra_body']}")
+            print(f"[DEBUG] extra_body content: {kwargs['extra_body']}")
+        
+        # Rich logging of the request details
+        request_info = {
+            "model": self.model,
+            "provider": self.provider,
+            "original_max_new_tokens": original_max_new_tokens,
+            "adjusted_max_new_tokens": max_new_tokens,
+            "max_completion_tokens": kwargs.get("max_completion_tokens"),
+            "max_tokens": kwargs.get("max_tokens"),
+            "is_o_series_model": any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]),
+            "token_param_used": "max_completion_tokens" if any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]) else "max_tokens",
+            "num_samples": num_samples,
+            "message_count": len(prompt) if isinstance(prompt, list) else 0,
+            "max_rpm": self.max_rpm,
+            "inter_request_delay": f"{60.0 / self.max_rpm:.2f}s",
+            "extra_body": kwargs.get("extra_body"),  # Add extra_body to request_info
+            "generation_parameters": {k: v for k, v in kwargs.items() 
+                                    if k not in ["model", "messages", "api_key", "base_url", "n", "caching"]}
+        }
+        
+        # Prepare a base meta string for titles if metadata provided
+        if metadata:
             try:
-                stop_sequence = self._prepare_stop_sequence(stop_sequence)
-                original_max_new_tokens = max_new_tokens
-                max_new_tokens = self._prepare_max_new_tokens(max_new_tokens)
+                idx = int(metadata.get("index", 1))
+                total = int(metadata.get("total", 0))
+            except Exception:
+                idx = metadata.get("index", 1)
+                total = metadata.get("total", 0)
+            base_meta = f"{metadata.get('benchmark', '')} {idx}/{total}"
+        else:
+            base_meta = None
+            
+        # Print the request in a panel with rich formatting
+        if base_meta:
+            request_title = f"Async LiteLLM API Request — {base_meta} — attempt {attempt}/5"
+        else:
+            request_title = "Async LiteLLM API Request"
+        console.print(Panel.fit(
+            "\n".join([
+                "[bold cyan]Async LiteLLM Request Details:[/bold cyan]",
+                f"[green]Model:[/green] {request_info['model']}",
+                f"[green]Provider:[/green] {request_info['provider']}",
+                f"[green]O-series Model:[/green] {request_info['is_o_series_model']}",
+                f"[green]Token Parameter Used:[/green] {request_info['token_param_used']}",
+                f"[green]Original max_new_tokens:[/green] {request_info['original_max_new_tokens']}",
+                f"[green]Adjusted max_new_tokens:[/green] {request_info['adjusted_max_new_tokens']}",
+                f"[green]max_completion_tokens:[/green] {request_info['max_completion_tokens']}",
+                f"[green]max_tokens:[/green] {request_info['max_tokens']}",
+                f"[green]num_samples:[/green] {request_info['num_samples']}",
+                f"[green]message_count:[/green] {request_info['message_count']}",
+                f"[green]Max RPM:[/green] {request_info['max_rpm']}",
+                f"[green]Inter-request delay:[/green] {request_info['inter_request_delay']}",
+                f"[green]Extra Body:[/green] {request_info['extra_body']}",
+                "[green]Generation Parameters:[/green]"
+            ]),
+            title=request_title,
+            border_style="blue"
+        ))
+        pprint(request_info["generation_parameters"])
+        
+        # Handle BadRequestError for content policy violations without retry
+        try:
+            # Make async API call using acompletion
+            response = await acompletion(**kwargs)
 
-                if return_logits and not self.provider == "openai":
-                    logger.warning("Returning logits is not supported for this provider, ignoring.")
-
-                # Prepare kwargs for completion call
-                kwargs = {
-                    "model": self.model,
-                    "messages": prompt,
-                    "logprobs": return_logits if self.provider == "openai" else None,
-                    "base_url": self.base_url,
-                    "n": num_samples,
-                    "caching": False,
-                    "cache": {"no-cache": True},
-                    "api_key": self.api_key,
-                    "request_timeout": 3600,  # 15 minutes timeout
-                }
-                if num_samples > 1 and self.generation_parameters.temperature == 0:
-                    raise ValueError(
-                        "num_samples > 1 but temperature is set to 0, this will not sample different outputs."
-                    )
-
-                if any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]):
-                    logger.warning("OpenAI o-series models do not support temperature, top_p, stop sequence. Disabling.")
-                else:
-                    # Update with generation parameters
-                    litellm_params = self.generation_parameters.to_litellm_dict()
-                    
-                    # If max_new_tokens is specified in generation parameters, handle it differently
-                    # Rename max_new_tokens to max_tokens for non-o-series models
-                    if "max_completion_tokens" in litellm_params and not any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]):
-                        litellm_params["max_tokens"] = litellm_params.pop("max_completion_tokens")
-                    
-                    kwargs.update(litellm_params)
-
-                # Use max_tokens instead of max_completion_tokens for all models except those starting with "o1", "o3", or "o4"
-                # Only set these if they aren't already set from generation_parameters
-                if not kwargs.get("max_completion_tokens") and not kwargs.get("max_tokens"):
-                    if any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]):
-                        kwargs["max_completion_tokens"] = max_new_tokens
-                    else:
-                        kwargs["max_tokens"] = max_new_tokens
-                
-                # Rich logging of the request details
-                request_info = {
-                    "model": self.model,
-                    "provider": self.provider,
-                    "original_max_new_tokens": original_max_new_tokens,
-                    "adjusted_max_new_tokens": max_new_tokens,
-                    "max_completion_tokens": kwargs.get("max_completion_tokens"),
-                    "max_tokens": kwargs.get("max_tokens"),
-                    "is_o_series_model": any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]),
-                    "token_param_used": "max_completion_tokens" if any(model_prefix in self.model for model_prefix in ["o1", "o3", "o4"]) else "max_tokens",
-                    "num_samples": num_samples,
-                    "message_count": len(prompt) if isinstance(prompt, list) else 0,
-                    "max_rpm": self.max_rpm,
-                    "inter_request_delay": f"{60.0 / self.max_rpm:.2f}s",
-                    "generation_parameters": {k: v for k, v in kwargs.items() 
-                                            if k not in ["model", "messages", "api_key", "base_url", "n", "caching"]}
-                }
-                
-                # Prepare a base meta string for titles if metadata provided
-                if metadata:
-                    try:
-                        idx = int(metadata.get("index", 1))
-                        total = int(metadata.get("total", 0))
-                    except Exception:
-                        idx = metadata.get("index", 1)
-                        total = metadata.get("total", 0)
-                    base_meta = f"{metadata.get('benchmark', '')} {idx}/{total}"
-                else:
-                    base_meta = None
-                    
-                # Print the request in a panel with rich formatting
+            # If response is empty, retry without caching (maybe the error is recoverable and solved with a retry)
+            if response.choices[0].message.content is None:
+                kwargs["caching"] = False
+                logger.info("Response is empty, retrying without caching")
+                response = await acompletion(**kwargs)
+            
+            # Log response details
+            try:
+                # Use base_meta to build response title
                 if base_meta:
-                    request_title = f"Async LiteLLM API Request — {base_meta} — attempt {attempt+1}/{self.API_MAX_RETRY}"
+                    response_title = f"Async LiteLLM API Response — {base_meta} — attempt {attempt}/5"
                 else:
-                    request_title = "Async LiteLLM API Request"
+                    response_title = "Async LiteLLM API Response"
                 console.print(Panel.fit(
                     "\n".join([
-                        "[bold cyan]Async LiteLLM Request Details:[/bold cyan]",
-                        f"[green]Model:[/green] {request_info['model']}",
-                        f"[green]Provider:[/green] {request_info['provider']}",
-                        f"[green]O-series Model:[/green] {request_info['is_o_series_model']}",
-                        f"[green]Token Parameter Used:[/green] {request_info['token_param_used']}",
-                        f"[green]Original max_new_tokens:[/green] {request_info['original_max_new_tokens']}",
-                        f"[green]Adjusted max_new_tokens:[/green] {request_info['adjusted_max_new_tokens']}",
-                        f"[green]max_completion_tokens:[/green] {request_info['max_completion_tokens']}",
-                        f"[green]max_tokens:[/green] {request_info['max_tokens']}",
-                        f"[green]num_samples:[/green] {request_info['num_samples']}",
-                        f"[green]message_count:[/green] {request_info['message_count']}",
-                        f"[green]Max RPM:[/green] {request_info['max_rpm']}",
-                        f"[green]Inter-request delay:[/green] {request_info['inter_request_delay']}",
-                        "[green]Generation Parameters:[/green]"
+                        "[bold cyan]Async LiteLLM Response Summary:[/bold cyan]",
+                        f"[green]Completion ID:[/green] {response.id}",
+                        f"[green]Model:[/green] {response.model}",
+                        f"[green]Created at:[/green] {response.created}",
+                        f"[green]Number of choices:[/green] {len(response.choices)}",
+                        f"[green]Content length:[/green] {len(response.choices[0].message.content or '') if response.choices else 0} chars",
+                        f"[green]Usage - Prompt tokens:[/green] {response.usage.prompt_tokens if response.usage else 'N/A'}",
+                        f"[green]Usage - Completion tokens:[/green] {response.usage.completion_tokens if response.usage else 'N/A'}",
+                        f"[green]Usage - Total tokens:[/green] {response.usage.total_tokens if response.usage else 'N/A'}"
                     ]),
-                    title=request_title,
-                    border_style="blue"
-                ))
-                pprint(request_info["generation_parameters"])
-                
-                # Make async API call using acompletion
-                response = await acompletion(**kwargs)
-
-                # If response is empty, retry without caching (maybe the error is recoverable and solved with a retry)
-                if response.choices[0].message.content is None:
-                    kwargs["caching"] = False
-                    logger.info("Response is empty, retrying without caching")
-                    response = await acompletion(**kwargs)
-                
-                # Log response details
-                try:
-                    # Use base_meta to build response title
-                    if base_meta:
-                        response_title = f"Async LiteLLM API Response — {base_meta} — attempt {attempt+1}/{self.API_MAX_RETRY}"
-                    else:
-                        response_title = "Async LiteLLM API Response"
-                    console.print(Panel.fit(
-                        "\n".join([
-                            "[bold cyan]Async LiteLLM Response Summary:[/bold cyan]",
-                            f"[green]Completion ID:[/green] {response.id}",
-                            f"[green]Model:[/green] {response.model}",
-                            f"[green]Created at:[/green] {response.created}",
-                            f"[green]Number of choices:[/green] {len(response.choices)}",
-                            f"[green]Content length:[/green] {len(response.choices[0].message.content or '') if response.choices else 0} chars",
-                            f"[green]Usage - Prompt tokens:[/green] {response.usage.prompt_tokens if response.usage else 'N/A'}",
-                            f"[green]Usage - Completion tokens:[/green] {response.usage.completion_tokens if response.usage else 'N/A'}",
-                            f"[green]Usage - Total tokens:[/green] {response.usage.total_tokens if response.usage else 'N/A'}"
-                        ]),
-                        title=response_title,
-                        border_style="green"
-                    ))
-                except Exception as e:
-                    console.print(f"[yellow]Warning: Could not print full response details: {e}[/yellow]")
-                    
-                return response
-            except litellm.BadRequestError as e:
-                if "message" in e.__dict__:
-                    error_string = (
-                        "The response was filtered due to the prompt triggering Microsoft's content management policy"
-                    )
-                    if error_string in e.__dict__["message"]:
-                        logger.warning(f"{error_string}. Returning empty response.")
-                        return ModelResponse()
-                
-                # Use the same base_meta to build error title
-                if base_meta:
-                    error_title = f"Async LiteLLM API Error — {base_meta} — attempt {attempt+1}/{self.API_MAX_RETRY}"
-                else:
-                    error_title = "Async LiteLLM API Error"
-                console.print(Panel.fit(
-                    f"[bold red]Error in async API Call (attempt {attempt + 1}/{self.API_MAX_RETRY}):[/bold red]\n{str(e)}",
-                    title=error_title,
-                    border_style="red"
+                    title=response_title,
+                    border_style="green"
                 ))
             except Exception as e:
-                wait_time = min(600, self.API_RETRY_SLEEP * (2**attempt))  # Exponential backoff with max 10 minutes
+                console.print(f"[yellow]Warning: Could not print full response details: {e}[/yellow]")
                 
-                # Use the same base_meta to build error title for retry
-                if base_meta:
-                    error_title = f"Async LiteLLM API Error — {base_meta} — attempt {attempt+1}/{self.API_MAX_RETRY}"
-                else:
-                    error_title = "Async LiteLLM API Error"
-                console.print(Panel.fit(
-                    f"[bold red]Error in async API Call (attempt {attempt + 1}/{self.API_MAX_RETRY}):[/bold red]\n{str(e)}\n\n" +
-                    f"[yellow]Waiting {wait_time} seconds before retry...[/yellow]",
-                    title=error_title,
-                    border_style="red"
-                ))
-                
-                logger.warning(
-                    f"Error in async API call: {e}, waiting {wait_time} seconds before retry {attempt + 1}/{self.API_MAX_RETRY}"
-                )
-                await asyncio.sleep(wait_time)
-
-        logger.error(f"Async API call failed after {self.API_MAX_RETRY} attempts, returning empty response.")
-        # Use base_meta to build final failure title
-        if base_meta:
-            failure_title = f"Async LiteLLM API Failure — {base_meta} — attempts {self.API_MAX_RETRY}"
-        else:
-            failure_title = "Async LiteLLM API Failure"
-        console.print(Panel.fit(
-            f"[bold red]Async API call failed after {self.API_MAX_RETRY} attempts[/bold red]\nReturning empty response.",
-            title=failure_title,
-            border_style="red"
-        ))
-        
-        # Create a mock LitellmModelResponse with empty content
-        from types import SimpleNamespace
-        
-        # Create a mock response that matches LiteLLM's structure
-        empty_choice = SimpleNamespace()
-        empty_choice.message = SimpleNamespace()
-        empty_choice.message.content = ""
-        
-        empty_usage = SimpleNamespace()
-        empty_usage.prompt_tokens = 0
-        empty_usage.completion_tokens = 0
-        
-        mock_response = SimpleNamespace()
-        mock_response.choices = [empty_choice]
-        mock_response.usage = empty_usage
-        
-        return mock_response
+            return response
+        except litellm.BadRequestError as e:
+            # Log BadRequestError and re-raise (no retry for bad requests)
+            if base_meta:
+                error_title = f"Async LiteLLM API Error — {base_meta} — attempt {attempt}/5"
+            else:
+                error_title = "Async LiteLLM API Error"
+            console.print(Panel.fit(
+                f"[bold red]BadRequestError in async API Call (attempt {attempt}/5):[/bold red]\n{str(e)}",
+                title=error_title,
+                border_style="red"
+            ))
+            raise  # Re-raise BadRequestError to stop retries
 
     async def __call_api_parallel(
         self,
@@ -594,6 +609,11 @@ class AsyncLiteLLMClient(LightevalModel):
 
         # Create bounded async API call function with rate limiting
         async def bounded_api_call(prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata):
+            # BUG FIX: Apply rate limiting BEFORE acquiring semaphore
+            # This prevents requests from timing out while waiting in the rate limiter queue
+            # after they've already acquired the semaphore. The timeout should only start
+            # counting once the request is actually ready to be sent.
+            await self._wait_for_rate_limit()
             async with self.semaphore:
                 return await self.__call_api(prompt, return_logits, max_new_tokens, num_samples, stop_sequence, metadata)
 

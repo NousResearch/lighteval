@@ -778,6 +778,22 @@ class Metrics(Enum):
         corpus_level_fn=np.mean,
         higher_is_better=True,
     )
+    gpqa_instruct_pass_at_1_16n = SampleLevelMetric(
+        metric_name="gpqa_pass@1:16_samples",
+        sample_level_fn=PassAtK(
+            k=1,
+            n=16,
+            sample_scoring_function=lambda doc, model_response: multilingual_extractive_match_metric(
+                language=Language.ENGLISH,
+                gold_extraction_target=[IndicesExtractionConfig(prefix_for_extraction="NativeLetters")],
+                pred_extraction_target=[IndicesExtractionConfig(prefix_for_extraction="NativeLetters")],
+                precision=6,
+            ).sample_level_fn(doc, model_response),
+        ).compute,
+        category=SamplingMethod.GENERATIVE,
+        corpus_level_fn=np.mean,
+        higher_is_better=True,
+    )
 
     def __str__(self):
         return self.name.replace("_at_", "@")

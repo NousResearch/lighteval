@@ -336,21 +336,13 @@ class LiteLLMClient(LightevalModel):
                     
                 return response
             except litellm.BadRequestError as e:
-                if "message" in e.__dict__:
-                    error_string = (
-                        "The response was filtered due to the prompt triggering Microsoft's content management policy"
-                    )
-                    if error_string in e.__dict__["message"]:
-                        logger.warning(f"{error_string}. Returning empty response.")
-                        return LitellmModelResponse()
-                
                 # Use the same base_meta to build error title
                 if base_meta:
                     error_title = f"LiteLLM API Error — {base_meta} — attempt {attempt+1}/{self.API_MAX_RETRY}"
                 else:
                     error_title = "LiteLLM API Error"
                 console.print(Panel.fit(
-                    f"[bold red]Error in API Call (attempt {attempt + 1}/{self.API_MAX_RETRY}):[/bold red]\n{str(e)}",
+                    f"[bold red]BadRequestError in API Call (attempt {attempt + 1}/{self.API_MAX_RETRY}):[/bold red]\n{str(e)}",
                     title=error_title,
                     border_style="red"
                 ))

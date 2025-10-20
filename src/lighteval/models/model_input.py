@@ -48,6 +48,9 @@ class GenerationParameters(BaseModel, extra="forbid"):
     # response format to be followed by the model,
     # more info here https://platform.openai.com/docs/api-reference/chat/create#chat-create-response_format
     response_format: str | None = None  # inference_providers
+    
+    # Extra body parameters to pass to the API (provider-specific parameters)
+    extra_body: dict | None = None  # litellm
 
     @classmethod
     def from_dict(cls, config_dict: dict):
@@ -111,7 +114,8 @@ class GenerationParameters(BaseModel, extra="forbid"):
             "seed": self.seed,
             "repetition_penalty": self.repetition_penalty,
             "frequency_penalty": self.frequency_penalty,
-            "request_timeout": 3600,  # 60 minutes timeout
+            "request_timeout": self.request_timeout or 86400,  # Use provided timeout or default to 24 hours
+            "extra_body": self.extra_body,  # Pass through provider-specific parameters
         }
         return {k: v for k, v in args.items() if v is not None}
 

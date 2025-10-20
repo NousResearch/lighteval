@@ -64,7 +64,7 @@ mmlu_pro = LightevalTaskConfig(
     evaluation_splits=["test"],
     few_shots_split="validation",
     few_shots_select=None,
-    generation_size=30000,  # needed for reasoning models like R1
+    generation_size=None,  # needed for reasoning models like R1
     stop_sequence=[],  # no stop sequence, will use eos token
     metrics=[
         SampleLevelMetric(
