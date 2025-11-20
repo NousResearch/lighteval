@@ -58,6 +58,7 @@ mmlu_pro = LightevalTaskConfig(
     name="mmlu_pro",
     suite=["extended"],
     prompt_function=mmlu_pro,
+    hf_revision="9126953e3e196ff1073499437322f9e2c51ed79a",
     hf_repo="TIGER-Lab/MMLU-Pro",
     hf_subset="default",
     hf_avail_splits=["validation", "test"],
