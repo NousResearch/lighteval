@@ -22,11 +22,8 @@ import nltk
 
 
 def download_nltk_resources():
-    """Download 'punkt' if not already installed"""
-    try:
-        nltk.data.find("tokenizers/punkt")
-    except LookupError:
-        nltk.download("punkt")
+    """Download 'punkt_tab' if not already installed"""
+    nltk.download("punkt_tab")
 
 
 download_nltk_resources()
